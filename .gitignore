@@ -1,0 +1,44 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Trading engine runtime state — NEVER commit
+# (data/ and logs/ are created at boot: db_manager/helpers call makedirs)
+# Covers the DB (+ -wal/-shm/-journal), engine_control.json and the soak
+# watchdog's state.json / events.jsonl / start_ms, which are not .db files.
+ultimate-bot/data/*
+!ultimate-bot/data/.gitkeep
+ultimate-bot/logs/*
+!ultimate-bot/logs/.gitkeep
+# DB_PATH/LOG_FILE are env-configurable, so runtime state can land outside those dirs
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Secret key material — NEVER commit
+# BINANCE_PRIVATE_KEY_PATH is configurable, so keys can live outside keys/
+*.pem
+*.key
+ultimate-bot/keys/*
+!ultimate-bot/keys/.gitkeep
+
+# Env files (template allowed)
+.env*
+!.env.example
+
+# Build info
+*.tsbuildinfo
