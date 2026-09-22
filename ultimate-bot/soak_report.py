@@ -73,7 +73,6 @@ def main():
     risk = {r["key"]: r["value"] for r in cur.execute("SELECT key, value FROM risk_state").fetchall()}
     equity = float(risk.get("paper_balance") or risk.get("total_equity") or 0)
     daily_pnl = float(risk.get("daily_pnl") or 0)
-    total_pnl_state = float(risk.get("total_realized_pnl") or 0)
     monitored = json.loads(risk["monitored_symbols"]) if "monitored_symbols" in risk else []
     scanned = json.loads(risk["scanned_pairs"]) if "scanned_pairs" in risk else []
 

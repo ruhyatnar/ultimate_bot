@@ -1,7 +1,10 @@
 /**
- * Dashboard UI smoke tests — render the REAL LiveDashboard component tree
+ * Dashboard UI smoke tests — render the REAL component tree
  * (react-dom/server) with engine-shaped fixtures and assert that every
  * section the operator relies on actually renders.
+ *
+ * Covers the LiveDashboard sections plus the App shell (tab navigation), so
+ * removing or rewiring a tab cannot silently break the served UI.
  *
  * Run with: npm run test:ui  (see scripts/ui_smoke.mjs)
  */
@@ -9,7 +12,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import App from '../../src/App';
 import { LiveDashboard } from '../../src/components/LiveDashboard';
+import { SignalInspector } from '../../src/components/SignalInspector';
+import { DebugConsole } from '../../src/components/DebugConsole';
+import { ConfigTab } from '../../src/components/ConfigTab';
+import { DeployGuide } from '../../src/components/DeployGuide';
 import type {
   BotConfig,
   ActiveTrade,
@@ -17,6 +25,7 @@ import type {
   MarketSymbolData,
   EngineRiskState,
   FuturesState,
+  LogMessage,
   Roadmap,
 } from '../../src/types';
 
@@ -305,4 +314,61 @@ test('futures account chip appears in futures market mode', () => {
   const html = render({ config: { ...baseConfig, market: 'futures', paperTrade: false } });
   assert.match(html, /FUTURES/);
   assert.match(html, /LIVE/);
+});
+
+// ─── App shell: tab navigation (no Project Code tab) ────────────────────────
+
+test('app shell renders exactly the five surviving tabs', () => {
+  const html = renderToStaticMarkup(<App />);
+  const ids = [...html.matchAll(/id="tab-([a-z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(ids, ['dashboard', 'signals', 'debug', 'config', 'deploy']);
+  // The removed feature must not leave a dead tab behind.
+  assert.doesNotMatch(html, /Project Code|tab-code|Download ZIP|ultimate-bot\.zip/);
+});
+
+test('app shell opens on the trading desk, rendered through App', () => {
+  const html = renderToStaticMarkup(<App />);
+  assert.match(html, /id="tab-dashboard"[^>]*aria-current="page"/);
+  assert.equal((html.match(/aria-current="page"/g) ?? []).length, 1);
+  assert.match(html, /Active Strategy/);
+  assert.match(html, /Monitored Symbols/);
+  assert.match(html, /Engine Health/);
+});
+
+test('every remaining tab body still renders', () => {
+  const logLine: LogMessage = {
+    id: 'log_1',
+    timestamp: new Date().toISOString(),
+    level: 'INFO',
+    category: 'SIGNAL',
+    message: 'NEARUSDT regime=UP rsi=31.2 -> NEUTRAL',
+    symbol: 'NEARUSDT',
+  };
+
+  assert.match(
+    renderToStaticMarkup(<SignalInspector symbolsData={symbolData} config={baseConfig} />),
+    /Engine Signal State/
+  );
+  assert.match(
+    renderToStaticMarkup(
+      <DebugConsole logs={[logLine]} onClearLogs={() => {}} signalInterval={10} />
+    ),
+    /Execution Engine &amp; Debug Terminal/
+  );
+  assert.match(
+    renderToStaticMarkup(
+      <ConfigTab
+        config={baseConfig}
+        onUpdateConfig={() => {}}
+        onApplyPreset={() => {}}
+        vpsConnected
+        onPushToVps={async () => ({ ok: true, message: '' })}
+      />
+    ),
+    /Strategy Preset/
+  );
+  const deploy = renderToStaticMarkup(<DeployGuide />);
+  assert.match(deploy, /Production VPS Deployment &amp; Live Readiness/);
+  // The ZIP-era deploy step is gone with the feature.
+  assert.doesNotMatch(deploy, /unzip|\.zip/);
 });

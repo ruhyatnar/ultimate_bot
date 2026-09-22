@@ -364,7 +364,7 @@ async def _probe_market(market, args, results, creds_ok):
              "skipped — WS API session auth requires an Ed25519 key (HMAC uses REST)")
         return
     for side, reduce_only in (("BUY", False), ("SELL", market == "futures")):
-        captured, ok = await _dry_run_ws(ws, symbol, side, qty, reduce_only)
+        captured, _ = await _dry_run_ws(ws, symbol, side, qty, reduce_only)
         if not captured:
             results[f"{market}.ws_{side.lower()}"] = False
             line(False, f"{market} WS API {side} builder", "builder did not produce a request")
@@ -419,7 +419,7 @@ async def _self_test():
         ws._private_key = object()
         ws._sign_ed25519 = lambda _m: "TESTSIG"
         for side, reduce_only in (("BUY", False), ("SELL", market == "futures")):
-            captured, ok = await _dry_run_ws(ws, symbol, side, qty, reduce_only)
+            captured, _ = await _dry_run_ws(ws, symbol, side, qty, reduce_only)
             built = {"path": captured["method"], "fields": dict(captured["params"])}
             problems = _verify_built(built, "order.place", market, side, symbol, True)
             line(not problems, f"self-test {market} WS {side}",

@@ -394,7 +394,7 @@ print(",".join(types) or "none")
         print("\n[5/5] Summary")
         failed = [r for r in RESULTS if not r[1]]
         print(f"  {len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
-        for name, ok, detail in RESULTS:
+        for name, ok, _ in RESULTS:
             print(f"    {'✓' if ok else '✗'} {name}")
         shutil.rmtree(tmp, ignore_errors=True)
         return 1 if failed else 0

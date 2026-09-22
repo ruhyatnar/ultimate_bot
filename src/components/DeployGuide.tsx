@@ -25,9 +25,9 @@ export const DeployGuide: React.FC = () => {
     },
     {
       id: 'step-1',
-      title: '2. Extract & Navigate to Project Directory',
-      desc: 'Unzip the downloaded bot project into your home directory on Debian 13.',
-      cmd: `unzip ultimate-bot.zip\ncd ultimate-bot`
+      title: '2. Clone & Navigate to Project Directory',
+      desc: 'Clone the repository onto your Debian 13 VPS and enter the Python engine folder.',
+      cmd: `git clone https://github.com/ruhyatnar/ultimate_bot.git\ncd ultimate_bot/ultimate-bot`
     },
     {
       id: 'step-2',

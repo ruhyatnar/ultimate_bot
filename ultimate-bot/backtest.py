@@ -247,11 +247,6 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
     start_equity = equity
     risk_per_trade = float(cfg.get("RISK_PER_TRADE", 0.01))
     max_daily_dd = float(cfg.get("MAX_DAILY_DRAWDOWN", 0.05))
-    min_rr = float(cfg.get("MIN_RISK_REWARD", 1.5))
-    min_tp_pct = float(cfg.get("MIN_TP_PERCENT", 0.03))
-    max_hold_s = float(cfg["MAX_HOLD_TIME"])   # config unit: SECONDS (matches engine)
-    sl_pct = float(cfg["SL_PERCENT"])
-    tp_pct = float(cfg["TP_PERCENT"])
     close_eod = bool(cfg.get("CLOSE_AT_UTC_DAY_END", True))
     # Notional allocation caps — mirrors RiskManager.calculate_position_size, which
     # takes min(risk-based size, allocation cap).

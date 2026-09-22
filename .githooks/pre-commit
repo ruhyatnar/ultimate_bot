@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook — refuse a commit when .env and .env.example have drifted apart.
+#
+# `ultimate-bot/.env` is the engine's source of truth and `.env.example` is its
+# documented mirror (which `status.py` also falls back to as a config source and
+# seeds a new .env from). A tuner push writes .env only, so the template drifts
+# silently — this hook makes that drift impossible to commit unnoticed.
+#
+# The check is a pure file comparison (no network, no engine, ~10 ms) and exits 0
+# when there is no .env to compare against, so a fresh clone or CI is unaffected.
+#
+# Install:   npm run hooks:install      (or: git config core.hooksPath .githooks)
+# Bypass:    git commit --no-verify
+#
+set -uo pipefail
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+check="$root/ultimate-bot/check_env_drift.py"
+
+# Repo without the engine (or a partial checkout): nothing to guard.
+[ -f "$check" ] || exit 0
+
+py=""
+for cand in "$root/ultimate-bot/venv/bin/python3" python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        py="$cand"
+        break
+    fi
+done
+
+# Never block someone's commit just because this box has no interpreter —
+# but say so, rather than passing silently.
+if [ -z "$py" ]; then
+    echo "pre-commit: no Python interpreter found — config drift check skipped." >&2
+    exit 0
+fi
+
+# --quiet: the findings only. This hook prints the one canonical fix command below,
+# so the check must not offer a second, less runnable one of its own.
+if ! out="$("$py" "$check" --quiet 2>&1)"; then
+    echo "" >&2
+    echo "✗ pre-commit: config drift check failed — commit blocked" >&2
+    echo "" >&2
+    echo "$out" | sed 's/^/    /' >&2
+    echo "" >&2
+    echo "  .env is the file the engine runs; .env.example has to mirror it." >&2
+    echo "  Fix:    $py ultimate-bot/check_env_drift.py --update" >&2
+    echo "  Bypass: git commit --no-verify   (only if .env is the file you intend to keep)" >&2
+    exit 1
+fi
+
+echo "✓ pre-commit: .env / .env.example in sync"
+exit 0

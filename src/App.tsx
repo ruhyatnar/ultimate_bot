@@ -25,7 +25,6 @@ import { VpsConnectionBar } from './components/VpsConnectionBar';
 import { LiveDashboard } from './components/LiveDashboard';
 import { SignalInspector } from './components/SignalInspector';
 import { DebugConsole } from './components/DebugConsole';
-import { CodeExplorer } from './components/CodeExplorer';
 import { ConfigTab } from './components/ConfigTab';
 import { DeployGuide } from './components/DeployGuide';
 
@@ -218,7 +217,7 @@ export default function App() {
     return DEFAULT_CONFIG;
   });
 
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'signals' | 'debug' | 'code' | 'config' | 'deploy'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'signals' | 'debug' | 'config' | 'deploy'>('dashboard');
 
   // Equity / daily PnL / streaks / cooldowns are engine-owned. They are ONLY ever
   // populated from the server snapshot, never synthesised in the browser.
@@ -1130,8 +1129,6 @@ export default function App() {
             signalInterval={config.signalInterval}
           />
         )}
-
-        {activeTab === 'code' && <CodeExplorer />}
 
         {activeTab === 'config' && (
           <ConfigTab

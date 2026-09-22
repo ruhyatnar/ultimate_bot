@@ -131,11 +131,8 @@ class FuturesWSApiClient(WSApiClient):
 
     # ------------------------------------------------------------------ core
 
-    # ------------------------------------------------------------------ core
-
     async def _get_server_time(self):
         """fapi host/time endpoint (spot override hits /api/v3 on api.binance.com)."""
-        import aiohttp
         session = await self._get_session()
         base = "https://demo-fapi.binance.com" if self.use_testnet else "https://fapi.binance.com"
         async with session.get(f"{base}/fapi/v1/time") as resp:

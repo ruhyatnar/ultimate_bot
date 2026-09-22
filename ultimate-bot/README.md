@@ -26,6 +26,12 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 
 ## 📝 Changelog
 
+### 2026-09-22 (2) — Config drift guard; `.env.example` reconciled with the deployed `.env`
+- **`.env.example` reconciled with the live `.env`.** The template had drifted on nine keys: `PAPER_TRADE`, `FUTURES_MARGIN_TYPE`, `FUTURES_ONE_WAY_MODE`, `REST_WEIGHT_LIMIT`, `RSI_TIMEFRAME`, `STATIC_SYMBOLS` and `TOP_CANDIDATES` held different values, and `MAX_TRADES_PER_DAY` / `RSI_TIMEFRAME_MS` existed only in `.env`. It now mirrors the deployment exactly — same **90 keys, zero drift**, only the three credential keys keeping placeholders — and carries a header block warning that it is **not** a safe sandbox, listing the five keys to change back on a fresh machine. `.env` itself was not modified (verified by hash before and after).
+- **New `check_env_drift.py`** (see [Config Drift Check](#config-drift-check-check_env_driftpy)): a stdlib-only guard that fails on keys present in only one file, duplicate keys, inline `#` comments on value lines, any non-exempt value difference, and any real credential reaching the template. `--update` re-mirrors the template from `.env` and refuses to copy anything credential-shaped into a tracked file. Wired as `npm run check:env` and into a new `npm run verify` aggregate (`lint` → `check:env` → `smoke` → `test:ui` → `test:sync`).
+- **Pre-commit hook** (`npm run hooks:install`, or `git config core.hooksPath .githooks`): every commit runs the drift check and is refused on drift, printing the fix command. The hook itself is versioned at `.githooks/pre-commit` because git only executes `.git/hooks/`, which is never committed. Verified end-to-end in a throwaway repo: an in-sync commit is allowed, a drifted commit is blocked (no commit object created), and `git commit --no-verify` bypasses it.
+- **Docs:** the engine README's Table of Contents had one broken link ("Architecture & Data Flow" pointed at a section that does not exist) and was missing this file's test section entirely — both corrected.
+
 ### 2026-09-22 — First live entry watch; multi-assets phantom-balance equity fix
 - **Fixed (`futures_ws_api_client.seed_balances`): WS-path equity was inflated ~5× ($23.01 → $111.75) on multi-assets accounts.** Caught while watching the first live entry: the engine alternated `equity $23.01 (via rest)` / `$111.75 (via ws)` every balance cycle. In Binance **multi-assets collateral mode** the account payload reports a collateral-equivalent `availableBalance` for every asset the wallet could use as margin (U, BFUSD, USDC, RWUSD, USD1, FDUSD, LDUSDT, BNB, BTC, ETH, …) while `walletBalance` is `0` for those it does not actually hold — the same USDT wallet restated in other denominations. The seed kept any row with `availableBalance > 0`, so BNB/BTC/ETH/USDC were cached as real holdings and `_fetch_equity` priced them at the real ticker (≈ $88.7), inflating `total_equity` — which feeds position sizing, the daily-drawdown breaker, the notional/allocation caps and the dashboard equity. A row is now seeded only when its **wallet** balance is non-zero; legacy `free`/`locked` shaped rows still seed. Verified on the live account: before = 11 rows / $111.74, after = 1 row / $23.02, matching `totalMarginBalance` $23.0059; after reload both transports report $23.0x. Regression guard: **S7** in `test_scenarios.py` (4 checks).
 - **Entry-gate behaviour confirmed live**: the gate evaluates once per hour at the `RSI_TIMEFRAME` bucket close (the "last read HH:MM UTC" note is the bucket's **close** time, derived as `bucket_index * bucket_ms + bucket_ms`). Watched the 01:00 UTC roll: all five dynamically-screened symbols refreshed with live RSI, `AVAXUSDT` printed RSI 31.66 vs oversold 40.0 but stayed `trigger=False` because RSI was still falling — the strategy requires oversold **and** turning up. No live fill yet (engine flat, 0 errors).
@@ -1133,7 +1139,7 @@ safety, empty-state no-op).
   web dashboard display. Smoke test passes 13/13 checks on both paper and live configurations.
 - **VERIFIED: web dashboard monitor fully synced with bot engine.** The React frontend
   (LiveDashboard, SignalInspector, DebugConsole, ConfigTab, DeployGuide, VpsConnectionBar,
-  Header, TuningControlBar, DynamicScreener, SymbolDetailModal, VpsSyncModal, CodeExplorer)
+  Header, TuningControlBar, DynamicScreener, SymbolDetailModal, VpsSyncModal)
   receives real-time updates via WebSocket push (1s snapshots) + HTTP polling fallback (2.5s)
   from status.py. All data flows correctly:
   - **Equity & PnL**: `total_equity`, `daily_pnl`, `unrealized_pnl` sync from SQLite risk_state
@@ -1193,17 +1199,17 @@ safety, empty-state no-op).
 ## 📑 Table of Contents
 
 1. [Core Features & Architecture](#-core-features--architecture)
-2. [Architecture & Data Flow](#-architecture--data-flow)
-3. [The intraday_rsi Strategy](#-the-intraday_rsi-strategy)
-4. [Paper vs. Live Trading](#-paper-vs-live-trading)
-5. [Live Readiness Checklist & Safety Protocols](#-live-readiness-checklist--safety-protocols)
-6. [Installation & Setup (Debian 13 VPS)](#-installation--setup-debian-13-vps)
-7. [Ed25519 Asymmetric API Key Setup](#-ed25519-asymmetric-api-key-setup)
-8. [Configuration Reference (`.env`)](#-configuration-reference-env)
-9. [Strategy Preset](#-strategy-preset)
-10. [Running the Bot (PM2 Supervision)](#-running-the-bot-pm2-supervision)
-11. [Monitoring: CLI, Web Server & Control API](#-monitoring-cli-web-server--control-api)
-12. [Risk Management & Safety Mechanisms](#-risk-management--safety-mechanisms)
+2. [The intraday_rsi Strategy](#-the-intraday_rsi-strategy)
+3. [Paper vs. Live Trading](#-paper-vs-live-trading)
+4. [Live Readiness Checklist & Safety Protocols](#-live-readiness-checklist--safety-protocols)
+5. [Installation & Setup (Debian 13 VPS)](#-installation--setup-debian-13-vps)
+6. [Ed25519 Asymmetric API Key Setup](#-ed25519-asymmetric-api-key-setup)
+7. [Configuration Reference (`.env`)](#-configuration-reference-env)
+8. [Strategy Preset](#-strategy-preset)
+9. [Running the Bot (PM2 Supervision)](#-running-the-bot-pm2-supervision)
+10. [Monitoring: CLI, Web Server & Control API](#-monitoring-cli-web-server--control-api)
+11. [Risk Management & Safety Mechanisms](#-risk-management--safety-mechanisms)
+12. [Smoke Test & Test Battery](#-smoke-test)
 13. [Backtesting (Prove It Before You Trade It)](#-backtesting-prove-it-before-you-trade-it)
 14. [Troubleshooting & Emergency Procedures](#-troubleshooting--emergency-procedures)
 
@@ -1701,6 +1707,46 @@ cd /path/to/ultimate-bot
 ```
 
 It can also be run from the repo root via `npm run smoke`. Requires network access to Binance (the engine fetches `exchangeInfo` at boot) and a free `/tmp/ultimate_bot.lock` (stop any running engine first).
+
+### Config Drift Check (`check_env_drift.py`)
+
+`.env` is the engine's source of truth; `.env.example` is its documented mirror — and not only documentation: `status.py` falls back to the template as its config source when `.env` is missing, and seeds a new `.env` from it. A tuner push from the web monitor writes `.env` only, so the template drifts silently and starts lying about what the bot is actually running (that is how the two files ended up disagreeing on nine keys in September 2026).
+
+`check_env_drift.py` is a stdlib-only guard that fails instead of waiting to be noticed. It parses both files strictly — it does **not** reuse `status.load_env()`, which merges process-env overrides and would mask real file differences — and exits non-zero on:
+
+1. **Keys present in only one file**, in either direction.
+2. **Duplicate keys** — silent shadowing; the last one wins.
+3. **Inline `#` comments on value lines** — this dotenv build folds the comment into the value.
+4. **Value drift** on any key outside the exempt set (the credential keys, which are expected to differ).
+5. **A real credential in the template** — either a non-placeholder value for a known credential key, or a new secret-shaped key mirrored verbatim.
+
+```bash
+cd /path/to/ultimate-bot
+./venv/bin/python3 check_env_drift.py          # exit 0 = in sync, 1 = drift
+./venv/bin/python3 check_env_drift.py --quiet  # findings only, no advice (used by the hook)
+# or from the repo root:
+npm run check:env
+```
+
+After an intentional config change, re-mirror the template from the live file:
+
+```bash
+./venv/bin/python3 check_env_drift.py --update
+npm run check:env -- --update            # same thing, via npm
+```
+
+`--update` rewrites changed values, appends keys the live config has and the template lacks, and comments out keys `.env` no longer sets. It **never** copies a credential: the exempt keys keep their placeholders, and any key whose name looks sensitive is skipped rather than written into a tracked file. Output redacts sensitive-looking values and drops ANSI colour when piped, so it is safe to gate a commit or a deploy on.
+
+With no `.env` present (a fresh clone, or CI without secrets) it prints `SKIP` and exits 0 — it never fails merely because secrets are absent. `npm run verify` runs this check together with the rest of the battery (`lint` → `check:env` → `smoke` → `test:ui` → `test:sync`).
+
+**Install it as a pre-commit hook** so drift cannot be committed at all:
+
+```bash
+cd /path/to/ultimate_bot
+npm run hooks:install          # or: bash scripts/install-hooks.sh
+```
+
+The hook lives versioned at `.githooks/pre-commit` — git only executes `.git/hooks/`, which is never committed — so the installer symlinks it into place. It is idempotent (re-running is harmless) and moves any pre-existing hook aside to a timestamped backup rather than clobbering it. After that, a drifted commit is refused with the exact `--update` command printed, plus the deliberate `git commit --no-verify` escape hatch. If no Python interpreter is found the hook warns and lets the commit through instead of blocking all work. Teams can skip the installer entirely and point git at the directory: `git config core.hooksPath .githooks`.
 
 ### Sync Integration Test (`sync_test.py`)
 

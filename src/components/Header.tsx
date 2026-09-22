@@ -5,7 +5,6 @@ import {
   Sliders,
   Terminal,
   Activity,
-  FileCode2,
   BookOpen,
   Zap,
   LayoutDashboard,
@@ -19,8 +18,8 @@ import { BotConfig } from '../types';
 interface HeaderProps {
   isRunning: boolean;
   onToggleRunning: () => void;
-  activeTab: 'dashboard' | 'signals' | 'debug' | 'code' | 'config' | 'deploy';
-  setActiveTab: (tab: 'dashboard' | 'signals' | 'debug' | 'code' | 'config' | 'deploy') => void;
+  activeTab: 'dashboard' | 'signals' | 'debug' | 'config' | 'deploy';
+  setActiveTab: (tab: 'dashboard' | 'signals' | 'debug' | 'config' | 'deploy') => void;
   config: BotConfig;
   activeTradesCount: number;
   unrealizedPnl: number;
@@ -38,7 +37,6 @@ const TABS: Array<{
   { id: 'dashboard', label: 'Trading Desk', icon: <LayoutDashboard className="w-3.5 h-3.5" />, iconClass: 'text-amber-400' },
   { id: 'signals', label: 'Signal State', icon: <Activity className="w-3.5 h-3.5" />, iconClass: 'text-indigo-400' },
   { id: 'debug', label: 'Engine Log', icon: <Terminal className="w-3.5 h-3.5" />, iconClass: 'text-emerald-400' },
-  { id: 'code', label: 'Project Code', icon: <FileCode2 className="w-3.5 h-3.5" />, iconClass: 'text-sky-400' },
   { id: 'config', label: 'Strategy & .env', icon: <Sliders className="w-3.5 h-3.5" />, iconClass: 'text-purple-400' },
   { id: 'deploy', label: 'VPS Guide', icon: <BookOpen className="w-3.5 h-3.5" />, iconClass: 'text-orange-400' }
 ];
