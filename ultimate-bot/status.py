@@ -166,8 +166,10 @@ def load_env(env_path=None):
 # mtime of the .env last loaded into the monitor's in-memory env_config.
 _ENV_MTIME = {"path": None, "mtime": None}
 
-# Cached capital-roadmap payload (live exchange data; refreshed every 10 min).
-_ROADMAP_CACHE = {"data": None, "ts": 0.0}
+# Cached capital-roadmap payload (live exchange data). Reused for 10 min, and
+# recomputed early whenever the engine's watched-pair set changes — the floors
+# belong to those specific symbols, so a rotated watchlist invalidates them.
+_ROADMAP_CACHE = {"data": None, "ts": 0.0, "pairs": None}
 
 # Futures soak PM2 process / DB conventions (see futures_soak.sh + soak_watchdog.py).
 _SOAK_DB = os.path.join(
@@ -687,6 +689,156 @@ def tail_log_file(log_path, lines=120):
         return []
 
 
+def _position_mark_price(pos, amount):
+    """Mark price for an engine-published position, or None when unknowable.
+
+    Prefers the exchange's own markPrice (present when the engine's snapshot
+    came from positionRisk). Otherwise derives it EXACTLY from the published
+    uPnL: for a linear USDⓈ-M contract uPnL = (mark - entry) * amount, so
+    `entry + uPnL / amount` is the mark for a long (amount > 0) and a short
+    (amount < 0) alike. Returns None rather than inventing a price.
+    """
+    mk = _safe_float(pos.get("mark_price"), 0.0)
+    if mk and mk > 0:
+        return mk
+    up = _safe_float(pos.get("unrealized_pnl"), None)
+    entry = _safe_float(pos.get("entry_price"), 0.0)
+    if up is None or not entry or not amount:
+        return None
+    # _safe_float again on the RESULT: a NaN/Inf amount or uPnL in a corrupt
+    # snapshot must degrade this one mark, not propagate into the payload.
+    mark = _safe_float(entry + (up / amount), 0.0)
+    return mark if mark > 0 else None
+
+
+def _normalize_futures_positions(futures_state):
+    """Fill the per-position fields the engine's WS-cache snapshot leaves empty.
+
+    Two divergences, both observed on the live payload:
+
+      * `leverage` / `margin_type` came back `null` on every position in the common
+        (user-data WS cache) path, while the snapshot's TOP level carried the real
+        account values from config — so the Futures card's header read `1× CROSSED`
+        with a `—×` column directly beneath it for the same position.
+      * `mark_price` / `liquidation_price` are only populated on the positionRisk
+        fallback path, so on the common path the card rendered `mark —` even though
+        the mark is exactly recoverable from the published uPnL.
+
+    Normalising here means every consumer of /api/status sees the same numbers, so
+    the Futures panel cannot disagree with the positions table about a symbol.
+    """
+    top_lev = futures_state.get("leverage")
+    top_margin = futures_state.get("margin_type")
+    for p in futures_state.get("positions") or []:
+        if not isinstance(p, dict):
+            continue
+        if p.get("leverage") in (None, ""):
+            p["leverage"] = top_lev
+        if not p.get("margin_type"):
+            p["margin_type"] = top_margin
+        if _safe_float(p.get("mark_price"), 0.0) <= 0:
+            derived = _position_mark_price(p, _safe_float(p.get("amount"), 0.0))
+            if derived is not None:
+                p["mark_price"] = derived
+
+
+def _engine_position_index(db_data, env_config, futures_state):
+    """Index the ENGINE's published live position state by symbol.
+
+    The monitor used to serve `active_trades` rows untouched, and that table has
+    no price column — so the dashboard's active-position row rendered the ENTRY
+    price as "now", a 0.00% change and $0.00 floating PnL (and parked the bracket
+    ladder marker on the entry) while the engine knew the real mark. This builds
+    the join from what the engine ALREADY publishes, on its own cadence: the
+    browser re-derives nothing and the monitor places no exchange order or call
+    of its own.
+
+      1. futures_state (risk_state) — the engine's position snapshot:
+         amount / entry_price / unrealized_pnl (plus mark & liquidation when the
+         snapshot came from positionRisk). Published every price cycle.
+      2. scanned_pairs (risk_state) — the engine's own screener prices, refreshed
+         on that same cycle. Covers spot/paper positions and any futures symbol
+         whose account snapshot carries no mark.
+
+    Returns {live, prices, age_s, stale}: `live` is keyed only by REAL positions
+    (so position counts cannot be inflated by a screener entry), `prices` holds
+    engine-published marks for every other monitored symbol. `stale` marks a
+    snapshot older than the balance-freshness budget: it is still served (like
+    ws_streams, the last known engine state beats a blank) but flagged so a
+    stopped engine is distinguishable from a live flat book.
+    """
+    age_s = None
+    if isinstance(futures_state, dict):
+        age_s = futures_state.get("age_s")
+    max_age = _safe_float(env_config.get("WS_BALANCE_MAX_AGE"), 90.0) + 60.0
+    stale = age_s is not None and age_s > max_age
+
+    prices = {}
+    for row in db_data.get("scanned_pairs") or []:
+        try:
+            sym = str(row.get("symbol") or "").upper()
+            px = float(row.get("price") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if sym and px > 0:
+            prices[sym] = px
+
+    live = {}
+    for p in (futures_state or {}).get("positions") or []:
+        try:
+            sym = str(p.get("symbol") or "").upper()
+        except (TypeError, ValueError, AttributeError):
+            continue
+        # _safe_float rejects NaN/Inf as well as junk: a non-finite amount in a
+        # corrupt snapshot must not register as a live position (it would inflate
+        # the position count and serve a bogus mark).
+        amount = _safe_float(p.get("amount"), 0.0)
+        if not sym or abs(amount) <= 1e-12:
+            continue
+        up = _safe_float(p.get("unrealized_pnl"), None)
+        mark = _position_mark_price(p, amount)
+        live[sym] = {
+            "amount": amount,
+            "entry_price": _safe_float(p.get("entry_price"), 0.0),
+            "unrealized_pnl": up,
+            "mark_price": mark if mark is not None else prices.get(sym),
+            "liquidation_price": _safe_float(p.get("liquidation_price"), None),
+            "paper": bool(p.get("paper")),
+            # Provenance per field: the account snapshot when it carried the mark
+            # or PnL, the engine's screener price otherwise.
+            "source": "engine-futures" if (mark is not None or up is not None)
+            else ("engine-scan" if sym in prices else "engine"),
+            "age_s": age_s,
+            "stale": stale,
+        }
+    return {"live": live, "prices": prices, "age_s": age_s, "stale": stale}
+
+
+def _engine_watched_symbols(db_data):
+    """The pair list the engine is ACTUALLY watching right now.
+
+    trade_logic.update_symbols resolves the screener's picks against
+    STATIC_SYMBOLS/MAX_SYMBOLS (retaining any symbol with an open trade) and
+    publishes the result as risk_state.monitored_symbols. Anything that needs
+    "which pairs is the bot on" must read THAT, rather than re-deriving it from
+    config — the static/dynamic/MAX_SYMBOLS trio cannot reproduce the screener's
+    selection, so such a re-derivation silently describes a different universe.
+
+    Returns [] when the engine has not published yet (older build, or no DB row);
+    callers must tolerate an empty list.
+    """
+    raw = db_data.get("risk", {}).get("monitored_symbols")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(s).upper() for s in parsed if s]
+
+
 def build_status_payload(env_config, db_path):
     """Compose the /api/status JSON. Single source of truth shared by the HTTP
     route and the /ws realtime push so both transports always agree."""
@@ -732,8 +884,15 @@ def build_status_payload(env_config, db_path):
                     if pub > 0
                     else None
                 )
+                _normalize_futures_positions(futures_state)
         except Exception:
             futures_state = None
+
+    # Which pairs the engine is watching right now (screener picks + static list
+    # + symbols with open trades). Read ONCE and shared: the served
+    # `monitored_symbols` field and the capital roadmap must never describe
+    # different universes.
+    monitored_symbols = _engine_watched_symbols(db_data)
 
     # Capital roadmap (live exchange floors/prices/funding + equity) — cached
     # 10 min: the data moves on exchange-hour timescales, not request timescales.
@@ -742,17 +901,36 @@ def build_status_payload(env_config, db_path):
         from capital_roadmap import compute_roadmap
 
         now = time.time()
+        watch = list(monitored_symbols)
         if (
             not isinstance(_ROADMAP_CACHE.get("data"), dict)
             or now - _ROADMAP_CACHE.get("ts", 0) > 600
+            # A rotated watchlist invalidates the cache immediately: the floors
+            # and prices already fetched belong to the OLD symbols, so serving
+            # them for up to 10 more minutes would report on pairs the engine has
+            # dropped and omit the ones it just picked up.
+            or _ROADMAP_CACHE.get("pairs") != watch
         ):
             eq = (
                 _safe_float(db_data.get("risk", {}).get("total_equity"), 0.0)
                 or None
             )
-            _ROADMAP_CACHE["data"] = compute_roadmap(eq or 0.0) if eq else None
+            # An empty watchlist (engine has not published) lets capital_roadmap
+            # fall back to its CLI default list; `pairs_source` records which one
+            # was used so the card can say so.
+            _ROADMAP_CACHE["data"] = (
+                compute_roadmap(eq, pairs=watch) if eq else None
+            )
             _ROADMAP_CACHE["ts"] = now
+            _ROADMAP_CACHE["pairs"] = watch
         roadmap = _ROADMAP_CACHE.get("data")
+        if isinstance(roadmap, dict):
+            # The roadmap's numbers (equity, proven notional, stage progress) are a
+            # SNAPSHOT taken when this cache entry was computed — the card must be
+            # able to say how old it is rather than presenting a 10-minute-old
+            # equity as if it were the live one on the same screen.
+            roadmap = dict(roadmap)
+            roadmap["age_s"] = round(max(0.0, now - _ROADMAP_CACHE.get("ts", now)), 1)
     except Exception:
         roadmap = None
 
@@ -775,57 +953,92 @@ def build_status_payload(env_config, db_path):
 
     signal_state = db_data.get("signal_state", [])
 
-    # Open-position summary — futures state is authoritative on live futures;
-    # the DB's open trades back paper mode / spot. unrealized_pnl covers ONLY
-    # positions WITHOUT an open trade row: the dashboard already computes
-    # floating PnL for tracked trades itself, so adding tracked positions here
-    # would double-count. This surfaces naked/untracked exposure (e.g. a
-    # position opened before a boot) instead of hiding it.
-    open_positions = 0
-    unrealized_pnl = 0.0
-    tracked_syms = set()
-    for t in db_data.get("trades") or []:
-        try:
-            tracked_syms.add(t.get("symbol"))
-        except Exception:
-            pass
-    if futures_state:
-        for p in futures_state.get("positions", []) or []:
-            try:
-                amt = abs(float(p.get("amount") or 0.0))
-            except (TypeError, ValueError):
-                amt = 0.0
-            if amt > 1e-12:
-                open_positions += 1
-                if p.get("symbol") not in tracked_syms:
-                    up = p.get("unrealized_pnl")
-                    if up is not None:
-                        try:
-                            unrealized_pnl += float(up)
-                        except (TypeError, ValueError):
-                            pass
-    if open_positions == 0:
-        try:
-            open_positions = len(tracked_syms)
-        except Exception:
-            open_positions = 0
+    # Open positions — ONE view, joined to the engine's own live state. The
+    # tracked rows come from active_trades (the engine's persisted management
+    # state: stop / trail / locks / size) and each is stamped with the mark and
+    # floating PnL the engine published for that symbol, so the dashboard's
+    # "Entry → Now", change %, Unrealized and bracket-ladder marker cannot
+    # disagree with the position the engine is actually managing. Exchange
+    # symbols that no row tracks are counted separately and contribute to
+    # untracked_pnl only — never double-counted against a tracked row the
+    # dashboard already values.
+    pos_index = _engine_position_index(db_data, env_config, futures_state)
+    live = pos_index["live"]
+    prices = pos_index["prices"]
 
-    # The engine's currently monitored pair list (trade_logic.update_symbols writes
-    # it to risk_state). Served so the web monitor watches EXACTLY the pairs the
-    # engine watches instead of guessing them from static/dynamic config.
-    monitored_symbols = []
-    raw_monitored = db_data.get("risk", {}).get("monitored_symbols")
-    if raw_monitored:
+    trades_view = []
+    tracked_syms = set()
+    for row in db_data.get("trades") or []:
         try:
-            parsed = (
-                json.loads(raw_monitored)
-                if isinstance(raw_monitored, str)
-                else raw_monitored
+            trade = dict(row)
+        except (TypeError, ValueError):
+            continue
+        sym = str(trade.get("symbol") or "").upper()
+        pos = live.get(sym) if sym else None
+        mark = (pos or {}).get("mark_price") or prices.get(sym)
+        if mark and mark > 0:
+            trade["current_price"] = mark
+        if pos:
+            tracked_syms.add(sym)
+            trade["live_qty"] = abs(pos.get("amount") or 0.0)
+            if pos.get("unrealized_pnl") is not None:
+                trade["unrealized_pnl"] = pos["unrealized_pnl"]
+            if pos.get("liquidation_price") is not None:
+                trade["liquidation_price"] = pos["liquidation_price"]
+            trade["position_source"] = pos.get("source")
+            trade["position_age_s"] = pos.get("age_s")
+            trade["position_stale"] = bool(pos.get("stale"))
+        else:
+            if sym:
+                tracked_syms.add(sym)
+            trade["position_source"] = "engine-scan" if mark else "db"
+        trades_view.append(trade)
+
+    untracked_syms = [s for s in live if s not in tracked_syms]
+    unrealized_pnl = 0.0
+    positions_pnl = 0.0
+    for sym, pos in live.items():
+        up = pos.get("unrealized_pnl")
+        if up is None:
+            continue
+        positions_pnl += up
+        if sym in untracked_syms:
+            unrealized_pnl += up
+    open_positions = len(tracked_syms | set(live))
+
+    # `monitored_symbols` was read once at the top of this function, before the
+    # capital roadmap, so the served list and the roadmap's pairs are the same
+    # universe by construction (see _engine_watched_symbols).
+
+    # Decision-loop heartbeat, published by the engine every iteration on EVERY
+    # path (trading / paused / health-pause). The dashboard's loop light must read
+    # THIS, not the age of the newest per-symbol signal snapshot: that snapshot only
+    # advances when a symbol gets past every gate (not while paused, not with a full
+    # book, not while the breaker is tripped), so a healthy engine could report a
+    # wedged loop within a single cycle.
+    loop_state = None
+    raw_loop = db_data.get("risk", {}).get("loop_state")
+    if raw_loop:
+        try:
+            loop_state = (
+                json.loads(raw_loop) if isinstance(raw_loop, str) else raw_loop
             )
-            if isinstance(parsed, list):
-                monitored_symbols = [str(s).upper() for s in parsed if s]
+            if isinstance(loop_state, dict):
+                beat = _safe_float(loop_state.get("cycle_ms"), 0.0)
+                loop_state["age_s"] = (
+                    round(max(0.0, time.time() * 1000 - beat) / 1000, 1)
+                    if beat > 0
+                    else None
+                )
+                # The engine's acknowledgement of the pause the monitor requested:
+                # the UI can then show "applied" instead of echoing its own wish.
+                loop_state["paused_applied"] = bool(
+                    loop_state.get("paused_applied")
+                )
+            else:
+                loop_state = None
         except Exception:
-            monitored_symbols = []
+            loop_state = None
 
     # Realtime transport health, published by the engine (ws_streams risk_state row).
     ws_streams = None
@@ -851,11 +1064,17 @@ def build_status_payload(env_config, db_path):
     return {
         "process": clean_status,
         "config": safe_config,
+        "loop_state": loop_state,
         "market": market,
         "paper_trade": paper_trade,
         "mode": f"{market}-{'paper' if paper_trade else 'live'}",
         "account": balance_info.get("account"),
         "open_positions": open_positions,
+        "positions_tracked": len(tracked_syms),
+        "positions_untracked": len(untracked_syms),
+        "positions_live": len(live),
+        "positions_age_s": pos_index["age_s"],
+        "positions_pnl": round(positions_pnl, 8),
         "untracked_pnl": round(unrealized_pnl, 4),
         "balance": balance_info,
         "candidates": candidates,
@@ -874,8 +1093,13 @@ def build_status_payload(env_config, db_path):
             "mode": f"{market}-{'paper' if paper_trade else 'live'}",
             "account": balance_info.get("account"),
             "open_positions": open_positions,
+            "positions_tracked": len(tracked_syms),
+            "positions_untracked": len(untracked_syms),
+            "positions_live": len(live),
+            "positions_age_s": pos_index["age_s"],
+            "positions_pnl": round(positions_pnl, 8),
             "untracked_pnl": round(unrealized_pnl, 4),
-            "trades": db_data.get("trades", []),
+            "trades": trades_view,
             "orders": db_data.get("orders", []),
             "stats": db_data.get("stats", {}),
             "balance": balance_info,
@@ -884,6 +1108,7 @@ def build_status_payload(env_config, db_path):
             "monitored_symbols": monitored_symbols,
             "balances": balance_info.get("balances", []),
             "ws_streams": ws_streams,
+            "loop_state": loop_state,
             "futures": futures_state,
             "roadmap": roadmap,
             "soak": soak,
@@ -2478,9 +2703,19 @@ def get_standalone_html():
         if (trades.length === 0) {
           document.getElementById('positionsTable').innerHTML = '<div style="color: #64748b; padding: 12px;">No active open positions.</div>';
         } else {
-          let html = '<table><thead><tr><th>Symbol</th><th>Side</th><th>Entry Price</th><th>Quantity</th><th>Stop Loss</th><th>Take Profit</th><th>Breakeven</th></tr></thead><tbody>';
+          // "Now" is the ENGINE's own mark — status.py joins its published position
+          // state (futures_state / scanned_pairs) onto every row, so this table
+          // cannot disagree with the position the engine is managing. Falls back
+          // to the entry price only when the engine published no mark.
+          let html = '<table><thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Now</th><th>Quantity</th><th>Stop Loss</th><th>Take Profit</th><th>Unrealized</th><th>Breakeven</th></tr></thead><tbody>';
           trades.forEach(t => {
-            html += `<tr><td><strong>${t.symbol}</strong></td><td style="color:${t.side==='BUY'?'#34d399':'#fb7185'}">${t.side}</td><td>$${parseFloat(t.entry_price).toFixed(4)}</td><td>${parseFloat(t.quantity).toFixed(4)}</td><td>$${parseFloat(t.stop_price||0).toFixed(4)}</td><td>$${parseFloat(t.take_profit||0).toFixed(4)}</td><td>${t.breakeven_activated?'<span style="color:#34d399">LOCKED</span>':'No'}</td></tr>`;
+            const entry = parseFloat(t.entry_price || 0);
+            const now = parseFloat(t.current_price || 0) || entry;
+            const qty = parseFloat(t.quantity || 0);
+            const pnl = (now - entry) * qty;
+            const pnlCol = pnl >= 0 ? '#34d399' : '#fb7185';
+            const chg = entry > 0 ? ((now - entry) / entry) * 100 : 0;
+            html += `<tr><td><strong>${t.symbol}</strong></td><td style="color:${t.side==='BUY'?'#34d399':'#fb7185'}">${t.side}</td><td>$${entry.toFixed(4)}</td><td>$${now.toFixed(4)} <span style="color:${pnlCol};font-size:11px">(${chg>=0?'+':''}${chg.toFixed(2)}%)</span></td><td>${qty.toFixed(4)}</td><td>$${parseFloat(t.stop_price||0).toFixed(4)}</td><td>$${parseFloat(t.take_profit||0).toFixed(4)}</td><td style="color:${pnlCol}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</td><td>${t.breakeven_activated?'<span style="color:#34d399">LOCKED</span>':'No'}</td></tr>`;
           });
           html += '</tbody></table>';
           document.getElementById('positionsTable').innerHTML = html;

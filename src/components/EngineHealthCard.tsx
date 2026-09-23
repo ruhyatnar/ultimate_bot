@@ -11,7 +11,12 @@ interface EngineHealthCardProps {
   engineRisk: EngineRiskState | null;
   breakerTripped: boolean;
   scanInterval: number;
-  lastSignalAgeS: number | null;
+  /** Age of the engine's decision-loop heartbeat (falls back to the newest signal snapshot). */
+  loopAgeS: number | null;
+  /** True when the age above came from the engine's heartbeat rather than the snapshot heuristic. */
+  loopFromHeartbeat: boolean;
+  /** Engine's acknowledgement of the pause request; null = engine published no heartbeat. */
+  pauseApplied: boolean | null;
 }
 
 /**
@@ -20,8 +25,8 @@ interface EngineHealthCardProps {
  *   1. Is the engine process up and accepting entries?   (Process row)
  *   2. Is the monitor's data feed live?                  (Monitor link row)
  *   3. Are all four realtime transports flowing?         (StreamLights strip)
- *   4. Is the engine's decision loop still publishing?   (Decision loop row —
- *      age of the last per-symbol signal snapshot; a frozen age = wedged loop)
+ *   4. Is the engine's decision loop still iterating?     (Decision loop row —
+ *      age of the engine's per-iteration heartbeat; a frozen age = wedged loop)
  * Any red item names exactly what to fix.
  */
 export const EngineHealthCard: React.FC<EngineHealthCardProps> = ({
@@ -32,10 +37,12 @@ export const EngineHealthCard: React.FC<EngineHealthCardProps> = ({
   engineRisk,
   breakerTripped,
   scanInterval,
-  lastSignalAgeS
+  loopAgeS,
+  loopFromHeartbeat,
+  pauseApplied
 }) => {
   const engineStale = typeof streams?.engine_age_s === 'number' && streams.engine_age_s > 30;
-  const loopAge = typeof lastSignalAgeS === 'number' ? lastSignalAgeS : null;
+  const loopAge = typeof loopAgeS === 'number' ? loopAgeS : null;
   const loopOk = loopAge !== null && loopAge <= Math.max(60, scanInterval * 6);
   const loopTone = loopAge === null ? 'text-slate-400' : loopOk ? 'text-emerald-300' : 'text-amber-300';
   // Engine's measured clock offset vs the exchange (null = never measured:
@@ -86,8 +93,20 @@ export const EngineHealthCard: React.FC<EngineHealthCardProps> = ({
             {engineRunning ? 'RUNNING' : 'DOWN'}
           </span>
           {controlPaused && (
-            <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
-              <PauseCircle className="h-3 w-3" /> entries paused
+            <span
+              className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                pauseApplied === false
+                  ? 'border-slate-500/40 bg-slate-500/10 text-slate-300'
+                  : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+              }`}
+              title={
+                pauseApplied === false
+                  ? 'The pause is written to the control file but the engine has not acknowledged it yet — it applies at the top of the next loop iteration.'
+                  : 'The engine has applied the pause: new entries are blocked, open positions stay managed.'
+              }
+            >
+              <PauseCircle className="h-3 w-3" />{' '}
+              {pauseApplied === false ? 'pause requested…' : 'entries paused'}
             </span>
           )}
           {breakerTripped && (
@@ -136,7 +155,11 @@ export const EngineHealthCard: React.FC<EngineHealthCardProps> = ({
           icon={<Signal className="h-3.5 w-3.5" />}
           label="Decision loop"
           ok={loopAge === null ? null : loopOk}
-          title={`Age of the engine's last per-symbol signal snapshot. The loop re-decides every ${scanInterval}s — a frozen age means the strategy loop is wedged.`}
+          title={
+            loopFromHeartbeat
+              ? `Age of the engine's decision-loop heartbeat, written every iteration on every path (trading, paused, health-pause). The loop runs every ${scanInterval}s — a frozen age means the loop itself is wedged.`
+              : `Age of the engine's last per-symbol signal snapshot (no heartbeat published by this build). It only advances when a symbol passes every gate, so it can read old while the engine is healthy — pausing or a full book freezes it.`
+          }
         >
           <span className={`num text-xs font-bold ${loopTone}`}>
             {loopAge === null ? 'no data' : `${loopAge < 90 ? `${Math.round(loopAge)}s` : `${Math.round(loopAge / 60)}m`} ago`}

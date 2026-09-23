@@ -14,6 +14,7 @@ import {
   SignalState,
   EngineRiskState,
   WsStreams,
+  LoopState,
   FuturesState,
   Roadmap,
   FuturesSoak
@@ -256,6 +257,7 @@ export default function App() {
   const [vpsBalance, setVpsBalance] = useState<VpsBalanceData | null>(null);
   // Engine-published realtime transport health (WS stream lights).
   const [wsStreams, setWsStreams] = useState<WsStreams | null>(null);
+  const [loopState, setLoopState] = useState<LoopState | null>(null);
   const [futuresState, setFuturesState] = useState<FuturesState | null>(null);
   const [roadmap, setRoadmap] = useState<Roadmap | null>(null);
   const [soak, setSoak] = useState<FuturesSoak | null>(null);
@@ -427,6 +429,24 @@ export default function App() {
           paused: json.control.paused,
           pauseReason: json.control.pause_reason || undefined
         });
+      }
+
+      // ---- decision-loop heartbeat (engine-published, every iteration) ----
+      const loop = json.loop_state ?? json.data?.loop_state ?? null;
+      if (loop && typeof loop === 'object' && !Array.isArray(loop)) {
+        setLoopState({
+          cycle_ms: Number(loop.cycle_ms) || 0,
+          cycle: Number(loop.cycle) || 0,
+          interval_s: Number(loop.interval_s) || 0,
+          phase: String(loop.phase ?? ''),
+          paused_requested: Boolean(loop.paused_requested),
+          paused_applied: Boolean(loop.paused_applied),
+          active_trades: Number(loop.active_trades) || 0,
+          symbols: Number(loop.symbols) || 0,
+          age_s: typeof loop.age_s === 'number' ? loop.age_s : null
+        });
+      } else {
+        setLoopState(null);
       }
 
       // ---- realtime transport health (engine-published WS stream lights) ----
@@ -657,7 +677,13 @@ export default function App() {
             trailingStop: asServerNum(t.trailing_stop) || asServerNum(t.stop_price),
             breakevenActivated: Boolean(t.breakeven_activated),
             unrealizedPnl: unPnl,
-            unrealizedPnlPct: unPnlPct
+            unrealizedPnlPct: unPnlPct,
+            // Provenance of the mark above: stamped by status.py from the engine's
+            // own published position state, never derived here.
+            positionSource: (t.position_source as ActiveTrade['positionSource']) ?? undefined,
+            liveQty: t.live_qty === undefined || t.live_qty === null ? undefined : asServerNum(t.live_qty),
+            positionAgeS: t.position_age_s === undefined || t.position_age_s === null ? null : asServerNum(t.position_age_s),
+            positionStale: Boolean(t.position_stale)
           };
         });
         setActiveTrades(mappedActive);
@@ -1110,6 +1136,7 @@ export default function App() {
             onToggleVpsPause={handleToggleVpsPause}
             serverStats={vpsStatus.stats || null}
             wsStreams={wsStreams}
+            loopState={loopState}
             futuresState={futuresState}
             untrackedPnl={untrackedPnl}
             roadmap={roadmap}

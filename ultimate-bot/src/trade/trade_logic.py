@@ -12,10 +12,8 @@ except ImportError:
 from src.exchange.balance_cache import get_account
 from src.strategies.trade_policy import (
     effective_bracket,
-    effective_stop,
+    evaluate_exit,
     ratchet_stops,
-    scale_out_plan,
-    scale_out_price,
 )
 
 
@@ -97,6 +95,11 @@ class TradeLogic:
         self.health_check = health_check
         self.logger = logging.getLogger(__name__)
         self.active_trades = {}
+        # Last values of each active trade actually written to SQLite, so
+        # manage_trade can flush on CHANGE instead of on a wall-clock window
+        # (see _persist_active_trade_if_changed) — the web monitor reads this
+        # table, so anything left in memory only renders as a stale position.
+        self._saved_trade_sig = {}
         self.current_symbols = []
         self.symbol_cooldowns = {}
         self.cooldown = max(10, int(config.get("SIGNAL_INTERVAL", 10)))
@@ -122,6 +125,8 @@ class TradeLogic:
         # renders the ENGINE's real decision (regime/RSI/trigger) and we skip
         # redundant writes when nothing changed.
         self._last_signal_state_json = None
+        # Monotonic counter for the loop heartbeat (see _publish_loop_state).
+        self._loop_cycle = 0
 
     def _read_control(self):
         """Read the control file only when it changed (cheap mtime check)."""
@@ -690,11 +695,13 @@ class TradeLogic:
                         await self.manage_trade(symbol)
                     except Exception as e:
                         self.logger.error(f"Error managing {symbol} during web pause: {e}")
+                await self._publish_loop_state("paused", paused_requested=True, paused_applied=True)
                 await asyncio.sleep(self.config["SIGNAL_INTERVAL"])
                 continue
 
             if self.health_check and self.health_check.pause_trading:
                 self.logger.warning("Trading paused by health check")
+                await self._publish_loop_state("health-pause", paused_applied=True)
                 await asyncio.sleep(30)
                 continue
             if not self.config["PAPER_TRADE"]:
@@ -726,7 +733,42 @@ class TradeLogic:
                     await asyncio.sleep(1)
             # Publish the real signal state for the web monitor (no-op when unchanged).
             await self._persist_signal_state()
+            await self._publish_loop_state("trading")
             await asyncio.sleep(self.config["SIGNAL_INTERVAL"])
+
+    async def _publish_loop_state(self, phase, paused_requested=False, paused_applied=False):
+        """Publish a decision-loop HEARTBEAT so the monitor can tell "the engine is
+        deliberately skipping entries" from "the engine stopped looping".
+
+        The dashboard's "Decision loop" light used to be inferred from the newest
+        per-symbol signal snapshot, whose timestamp only advances when a symbol gets
+        PAST every gate: `process_symbol` returns before `generate_signal` for active
+        trades, cooling-down symbols, a full slot list and a tripped breaker, and the
+        pause branch never evaluates symbols at all. A perfectly healthy engine could
+        therefore report a frozen loop within one cycle — pausing from the dashboard
+        was enough to make it claim the strategy loop was wedged, and so was holding a
+        full book. Liveness has to be reported by the thing that is alive: this row is
+        written once per iteration on EVERY path (trading, paused, health-pause).
+
+        One small row per cycle (~10s) — deliberately never skipped when unchanged,
+        unlike signal_state, because a heartbeat that coalesces is not a heartbeat.
+        """
+        self._loop_cycle += 1
+        snap = {
+            "cycle_ms": int(time.time() * 1000),
+            "cycle": self._loop_cycle,
+            "interval_s": int(self.config.get("SIGNAL_INTERVAL", 10) or 10),
+            "phase": phase,
+            "paused_requested": bool(paused_requested),
+            "paused_applied": bool(paused_applied),
+            "active_trades": len(self.active_trades),
+            "symbols": len(self.current_symbols),
+        }
+        try:
+            await self.db.set_risk_state("loop_state", json.dumps(snap))
+        except Exception as e:
+            # Never let monitor telemetry disturb trading.
+            self.logger.debug(f"Could not publish loop heartbeat: {e}")
 
     async def process_symbol(self, symbol):
         self.logger.debug(f"Processing symbol {symbol}")
@@ -900,6 +942,7 @@ class TradeLogic:
         self._bucket_entry_latch[symbol] = int(time.time() * 1000 // bucket_ms)
         self.active_trades[symbol] = trade
         await self.db.save_active_trade(trade)
+        self._mark_trade_persisted(symbol, trade)
         await self.webhook.send(f"ENTRY {symbol} ({side}) Price: {entry_price:.2f} SL: {stop_price:.2f} TP: {take_profit:.2f} Size: {qty:.4f} ID: {order_id}")
 
     async def manage_trade(self, symbol):
@@ -920,90 +963,72 @@ class TradeLogic:
                     trade["atr"] = atr
                     self.last_atr_update[symbol] = now
 
-        if trade["side"] == "BUY":
-            # Scale-out (professional trade management): once price travels 1R
-            # (the initial stop distance) in favor, sell a fixed fraction (50%)
-            # to bank a partial profit, then trail the runner risk-free. This is
-            # the standard "take money off the table" discipline that converts
-            # a marginal raw win-rate into a positive expectancy curve.
-            if (
-                not trade.get("scale_out_done", False)
-                and trade.get("initial_qty")
-                and trade["quantity"] > 0
-            ):
-                # Levels/units come from the SHARED policy (trade_policy.py) so the
-                # backtest banks the same partial at the same R multiple. R is
-                # anchored on the INITIAL stop: the breakeven lock raises the live
-                # stop long before +1R, which would otherwise make (entry - stop)
-                # negative and permanently disable scale-out.
-                level = scale_out_price(trade["entry_price"], trade.get("initial_stop_price"),
-                                        trade["stop_price"], self.config)
-                units = scale_out_plan(trade["entry_price"], trade["quantity"],
-                                       trade.get("initial_stop_price"), trade["stop_price"], self.config)
-                if units > 0 and level and price >= level:
-                    await self._scale_out(symbol, trade, units)
-
-        # Gap-breach protection: compare against bar LOWS/HIGHS, not just the
-        # current tick. A tick-based check alone misses violent wicks that spike
-        # through the stop between SIGNAL_INTERVAL polls and bounce back — the #1
-        # cause of unexpected deep losses in live market-only bots. We evaluate
-        # both the just-closed candle and the forming one (the exchange returns
-        # them newest-last) so a wick on a candle that closed between polls is
-        # still caught, not only the one that happens to be open right now.
-        # NOTE: this block runs before the intraday EOD close so a same-bar SL/TP
-        # breach always wins over the day-end market close.
+        # ---- exit decision (ONE policy: trade_policy.evaluate_exit) ----
+        # Evidence is normalised to what the engine actually observes between
+        # polls: the wick range of the post-entry candles — so a wick that spiked
+        # through the stop between cycles is still caught — folded together with
+        # the live tick, plus the tick as the price a market order placed right now
+        # would fill at. evaluate_exit is the exact function the backtest replays,
+        # so the ordering (stop → TP → time stop → day-end → scale-out) and the
+        # exit reasons cannot drift from the backtested model. Nothing here
+        # short-circuits before the policy: a missing kline response degrades to
+        # tick evidence instead of skipping the stop check entirely.
+        entry_ms = float(trade.get("entry_time", 0)) * 1000.0
         recent = await self.rest.get_klines(symbol, self.config["TIMEFRAME"], 2)
-        if recent:
-            # Only wicks that occurred AFTER the entry may stop us out (see
-            # _post_entry_wick_range). No post-entry candle yet -> the tick
-            # backstop below still guards the position.
-            entry_ms = float(trade.get("entry_time", 0)) * 1000.0
-            low, high = _post_entry_wick_range(recent, entry_ms)
-            if low is None or high is None:
-                low, high = price, price
-            # Evaluate both just-closed and forming candles (newest-last from the
-            # exchange) so a wick on a candle that closed between polls still triggers.
-            # Effective stop = the higher of the hard stop and an ARMED trailing
-            # stop (shared policy), so a trail breach is caught by the same wick
-            # check and reported under its own exit reason.
-            eff_stop = effective_stop(trade["stop_price"], trade.get("trailing_stop"),
-                                      trade.get("trailing_active"))
-            trail_armed = bool(trade.get("trailing_active")) and eff_stop > float(trade["stop_price"])
-            stop_reason = "TRAILING_STOP" if trail_armed else "STOP_LOSS"
-            if low <= eff_stop:
-                await self.close_trade(symbol, stop_reason, fill_override=min(eff_stop, low))
-                return
-            if high >= trade["take_profit"]:
-                await self.close_trade(symbol, "TAKE_PROFIT", fill_override=trade["take_profit"])
-                return
-            # Tick-level check as immediate backstop
-            if price <= eff_stop:
-                await self.close_trade(symbol, stop_reason); return
-            if price >= trade["take_profit"]:
-                await self.close_trade(symbol, "TAKE_PROFIT"); return
-        if time.time() - trade["entry_time"] > self.config["MAX_HOLD_TIME"]:
-            await self.close_trade(symbol, "TIME_STOP"); return
+        # Only wicks that occurred AFTER the entry may stop us out (see
+        # _post_entry_wick_range); with no post-entry candle yet the tick is the
+        # only evidence there is.
+        low, high = _post_entry_wick_range(recent, entry_ms) if recent else (None, None)
+        if low is None or high is None:
+            low = high = price
+        else:
+            low, high = min(low, price), max(high, price)
 
         # intraday_rsi: force-close positions at the UTC day end so every trade
-        # matches the backtest's same-day-exit convention. Runs AFTER SL/TP checks
-        # (a stop or TP breach in the same cycle always wins) and before trailing.
+        # matches the backtest's same-day-exit convention. The trigger is the only
+        # venue-specific part (a wall clock here, the first bar of a new UTC day in
+        # a replay), which is why the policy takes it as an input; the ORDER — after
+        # the stop/TP checks, so a breach in the same cycle always wins — is shared.
+        eod = False
         if self.config.get("CLOSE_AT_UTC_DAY_END", False):
-            from datetime import datetime as _dt, timezone as _tz
-            now_utc = _dt.now(_tz.utc)
+            now_utc = datetime.now(timezone.utc)
             secs_into_day = now_utc.hour * 3600 + now_utc.minute * 60 + now_utc.second
-            if secs_into_day >= 86100:   # last 5 minutes of the UTC day (23:55:00)
+            eod = secs_into_day >= 86100   # last 5 minutes of the UTC day (23:55:00)
+
+        plan = evaluate_exit(
+            trade["entry_price"], trade["quantity"], trade["stop_price"],
+            trade["take_profit"], self.config,
+            low=low, high=high, reference_price=price,
+            now_ms=now * 1000.0, entry_ms=entry_ms,
+            trailing_stop=trade.get("trailing_stop"),
+            trailing_active=trade.get("trailing_active", False),
+            initial_stop_price=trade.get("initial_stop_price"),
+            scale_out_done=trade.get("scale_out_done", False),
+            eod=eod,
+        )
+        if plan.reason:
+            if plan.reason == "EOD_CLOSE":
                 self.logger.info(f"{symbol}: UTC day end (intraday close) — closing position.")
-                await self.close_trade(symbol, "EOD_CLOSE"); return
+            await self.close_trade(symbol, plan.reason, fill_override=plan.fill)
+            return
+        # Scale-out: banks a partial profit at +1R and keeps the runner open, so it
+        # is the only non-terminal outcome. Long-only (the policy's R maths assumes
+        # a long bracket).
+        if plan.partial_units > 0 and trade.get("side") == "BUY":
+            await self._scale_out(symbol, trade, plan.partial_units)
 
         # Profit-protection ladder (shared policy: breakeven lock, then trailing
         # stop). Ratchets only ever RAISE the stop, and they apply from the NEXT
-        # cycle — the exit checks above always used the stop as it stood when the
+        # evaluation — the decision above always used the stop as it stood when the
         # cycle began, which is exactly the backtest's pessimistic convention.
+        # The favourable extreme fed in is `high` — the same observable the backtest
+        # feeds as its bar high — not the bare tick, so both sides ratchet the trail
+        # off the most favourable price seen rather than the last one sampled.
         was_trailing = bool(trade.get("trailing_active"))
         was_breakeven = bool(trade.get("breakeven_activated"))
         prev_stop = float(trade["stop_price"])
         updates = ratchet_stops(
-            trade["entry_price"], price, trade["stop_price"], self.config,
+            trade["entry_price"], high, trade["stop_price"], self.config,
             trailing_stop=trade.get("trailing_stop"),
             trailing_active=was_trailing,
             breakeven_activated=was_breakeven,
@@ -1025,11 +1050,65 @@ class TradeLogic:
         if trade["stop_price"] > prev_stop:
             self.logger.debug(f"{symbol}: protective stop raised {prev_stop:.6f} → {trade['stop_price']:.6f}.")
 
+        # The ratchet can itself reveal a breach: with an ATR trail (`new = high -
+        # 2×ATR`) the raised stop can sit above the current tick when the favourable
+        # extreme is well above it. The backtest catches that on its next bar, since
+        # its decision also runs before the ratchet — this is the same rule evaluated
+        # one cycle sooner, not a second one.
         if trade["trailing_active"] and price <= trade["trailing_stop"]:
             await self.close_trade(symbol, "TRAILING_STOP"); return
 
-        if int(time.time()) % 30 == 0:
+        await self._persist_active_trade_if_changed(symbol, trade)
+
+    # Every field the web monitor renders for an open position (and therefore
+    # every field whose staleness would make the dashboard disagree with the
+    # engine). A change in any of them must reach SQLite promptly.
+    _PERSISTED_TRADE_FIELDS = (
+        "entry_price", "quantity", "stop_price", "take_profit", "atr",
+        "trailing_active", "trailing_stop", "breakeven_activated",
+        "scale_out_done", "initial_qty", "initial_stop_price",
+    )
+
+    async def _persist_active_trade_if_changed(self, symbol, trade, heartbeat=60.0):
+        """Flush a managed trade to SQLite when a rendered field ACTUALLY changed.
+
+        The engine keeps the live position in memory and the web monitor reads
+        only the DB row, so a field left unpublished renders as a stale position:
+        the dashboard's bracket ladder, trailing/breakeven locks and size all come
+        straight from this row, while the exits are decided from memory.
+
+        This replaces `if int(time.time()) % 30 == 0: save_active_trade(trade)`,
+        which fired only inside a one-second window every 30s and — with the 10s
+        decision cadence — routinely skipped it entirely, letting a ratcheted
+        trail sit unpublished for minutes (and indefinitely on a slower cadence).
+        A signature compare writes exactly once per real change, with a slow
+        heartbeat so an interrupted write cannot leave the row behind forever.
+        Failures are non-fatal and retried on the next cycle: a DB hiccup must
+        never block stop/TP management.
+        """
+        try:
+            sig = tuple(trade.get(f) for f in self._PERSISTED_TRADE_FIELDS)
+        except Exception:
+            return
+        now = time.time()
+        prev = self._saved_trade_sig.get(symbol)
+        if prev is not None and prev[0] == sig and (now - prev[1]) < heartbeat:
+            return
+        try:
             await self.db.save_active_trade(trade)
+            self._mark_trade_persisted(symbol, trade, now)
+        except Exception as e:
+            self.logger.warning(f"{symbol}: could not persist active trade state: {e}")
+
+    def _mark_trade_persisted(self, symbol, trade, now=None):
+        """Record that `trade`'s rendered fields are now in SQLite for `symbol`."""
+        try:
+            self._saved_trade_sig[symbol] = (
+                tuple(trade.get(f) for f in self._PERSISTED_TRADE_FIELDS),
+                now if now is not None else time.time(),
+            )
+        except Exception:
+            pass
 
     async def _scale_out(self, symbol, trade, scale_qty):
         """Sell a fraction of the position at +1R and mark the trade as scaled out.
@@ -1292,11 +1371,15 @@ class TradeLogic:
             trade["quantity"] = remaining_qty
             self.active_trades[symbol] = trade
             await self.db.save_active_trade(trade)
+            self._saved_trade_sig.pop(symbol, None)
             await self.risk_mgr.update_trade_result(pnl, symbol)
             await self.webhook.send(f"⚠️ Partial exit for {symbol} ({reason}): {executed_qty} of {original_qty} sold. Net PnL (after fees): {pnl:+.2f} USDT. Remaining {remaining_qty} units.")
             return
 
         await self.db.delete_active_trade(symbol)
+        # Forget the persisted signature: a later re-entry must write its own row
+        # even if it lands on identical values (same stop/TP/size).
+        self._saved_trade_sig.pop(symbol, None)
         await self.risk_mgr.update_trade_result(pnl, symbol)
         if not self.config["PAPER_TRADE"]:
             try:

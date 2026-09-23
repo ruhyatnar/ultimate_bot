@@ -16,7 +16,7 @@ import {
   ShieldAlert,
   PauseCircle
 } from 'lucide-react';
-import { BotConfig, ActiveTrade, ClosedTrade, MarketSymbolData, CandidateSymbol, EngineRiskState, WsStreams, FuturesState, Roadmap, FuturesSoak, VpsBalanceData, PushResult } from '../types';
+import { BotConfig, ActiveTrade, ClosedTrade, MarketSymbolData, CandidateSymbol, EngineRiskState, WsStreams, LoopState, FuturesState, Roadmap, FuturesSoak, VpsBalanceData, PushResult } from '../types';
 import { TuningControlBar } from './TuningControlBar';
 import { DynamicScreener } from './DynamicScreener';
 import { SymbolDetailModal } from './SymbolDetailModal';
@@ -62,6 +62,7 @@ interface LiveDashboardProps {
     total_realized_pnl?: number;
   } | null;
   wsStreams: WsStreams | null;
+  loopState: LoopState | null;
   futuresState: FuturesState | null;
   untrackedPnl: number | null;
   roadmap: Roadmap | null;
@@ -170,6 +171,7 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   onToggleVpsPause,
   serverStats,
   wsStreams,
+  loopState,
   futuresState,
   untrackedPnl,
   roadmap,
@@ -235,10 +237,18 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
     ? 'bg-sky-500/20 text-sky-300 border-sky-500/30'
     : 'bg-rose-500/20 text-rose-300 border-rose-500/30';
 
-  // Age of the newest per-symbol signal snapshot (engine decision-loop freshness).
-  const lastSignalAgeS = symbolsData.length
+  // Decision-loop freshness. The engine's own heartbeat is authoritative: it is
+  // written once per iteration on every path, whereas the newest per-symbol
+  // decision timestamp only advances when a symbol gets past every gate (pausing,
+  // a full book or a tripped breaker freezes it while the engine is healthy). The
+  // snapshot age is kept only as a fallback for engines that predate the beat.
+  const fallbackSignalAgeS = symbolsData.length
     ? Math.max(0, (Date.now() - Math.max(...symbolsData.map(s => s.signal?.time ?? 0))) / 1000)
     : null;
+  const loopAgeS = loopState?.age_s ?? fallbackSignalAgeS;
+  // null = the engine published no heartbeat: show the request as applied rather
+  // than inventing a pending state for an older build.
+  const pauseApplied = loopState ? loopState.paused_applied : null;
 
   return (
     <div className="space-y-6">
@@ -459,7 +469,9 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
         engineRisk={engineRisk}
         breakerTripped={breakerTripped}
         scanInterval={config.signalInterval}
-        lastSignalAgeS={lastSignalAgeS}
+        loopAgeS={loopAgeS}
+        loopFromHeartbeat={loopState?.age_s != null}
+        pauseApplied={pauseApplied}
       />
 
       {/* ── §4 Market: watchlist + screener side-by-side (stacks on mobile) ── */}
@@ -673,6 +685,16 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
                             ({changePct >= 0 ? '+' : ''}{changePct.toFixed(2)}%)
                           </span>
                         </div>
+                        {/* The engine stopped republishing its position snapshot: this is
+                            its last known state, not a live one. */}
+                        {trade.positionStale && (
+                          <div
+                            className="mt-0.5 text-[10px] font-semibold text-amber-400"
+                            title="The engine stopped republishing its position snapshot — this mark is its last known state, not a live one."
+                          >
+                            engine stale{trade.positionAgeS != null ? ` · ${Math.round(trade.positionAgeS)}s old` : ''}
+                          </div>
+                        )}
                       </td>
 
                       <td className="num py-3.5 px-4">

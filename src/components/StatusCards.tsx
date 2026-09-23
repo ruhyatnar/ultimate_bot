@@ -80,6 +80,20 @@ export const RoadmapCard: React.FC<{ roadmap: Roadmap | null }> = ({ roadmap }) 
   const progress = nextStage
     ? Math.min(100, (roadmap.equity / nextStage.threshold) * 100)
     : 100;
+  // Every figure below is a SNAPSHOT taken when the monitor last recomputed it
+  // (exchange floors + prices, cached 10 min), so the age is shown rather than
+  // implied. The header's Equity is the live number — they are not the same read.
+  const roadmapAgeS = roadmap.age_s ?? null;
+  const roadmapAgeLabel = roadmapAgeS == null
+    ? 'refreshed 10 min'
+    : roadmapAgeS < 90
+      ? `computed ${Math.round(roadmapAgeS)}s ago`
+      : `computed ${Math.round(roadmapAgeS / 60)}m ago`;
+  // Which universe is on screen: the engine's live watched symbols (the screener
+  // rotates them), or the fallback list used only before the engine publishes.
+  const roadmapUniverse = roadmap.pairs_source === 'default'
+    ? `${roadmap.pairs.length} fallback pairs`
+    : `${roadmap.pairs.length} engine-watched pairs`;
   return (
     <div className="bg-slate-800/80 border border-slate-700/60 rounded-xl p-5 shadow-sm">
       <div className="flex items-center justify-between mb-3">
@@ -87,11 +101,13 @@ export const RoadmapCard: React.FC<{ roadmap: Roadmap | null }> = ({ roadmap }) 
           <TrendingUp className="w-4 h-4" />
           <span>Capital Roadmap</span>
         </h3>
-        <span className="text-[10px] text-slate-500">live exchange floors · refreshed 10 min</span>
+        <span className="text-[10px] text-slate-500">
+          {roadmapUniverse} · live exchange floors · {roadmapAgeLabel}
+        </span>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs mb-3">
         <div className="bg-slate-900/60 rounded-lg p-2">
-          <div className="text-[10px] text-slate-500">Equity</div>
+          <div className="text-[10px] text-slate-500">Equity (at compute)</div>
           <div className="font-mono text-slate-200">${roadmap.equity.toFixed(2)}</div>
         </div>
         <div className="bg-slate-900/60 rounded-lg p-2">

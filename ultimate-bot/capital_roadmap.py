@@ -12,9 +12,10 @@ and the account's equity from the engine DB (or --equity override), then prints 
 stage table. No orders are ever placed — read-only.
 
 Usage:
-  ./venv/bin/python3 capital_roadmap.py                 # equity from live DB
-  ./venv/bin/python3 capital_roadmap.py --equity 22     # force a number
-  ./venv/bin/python3 capital_roadmap.py --pairs NEARUSDT,LINKUSDT
+  ./venv/bin/python3 capital_roadmap.py        # equity AND pairs from the live DB:
+                                               # the pairs are the engine's watched set
+  ./venv/bin/python3 capital_roadmap.py --equity 22     # force the equity
+  ./venv/bin/python3 capital_roadmap.py --pairs NEARUSDT,LINKUSDT   # force the pairs
 """
 import argparse
 import json
@@ -27,6 +28,10 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 FUTURES_BASE = "https://fapi.binance.com"
+# CLI default / last-resort fallback ONLY. The served roadmap is given the
+# ENGINE'S live watched set instead (see compute_roadmap's `pairs`): the engine
+# runs DYNAMIC_SYMBOLS with a rotating screener selection, so a list baked in
+# here would analyse pairs the bot is not trading while missing the ones it is.
 DEFAULT_PAIRS = ["NEARUSDT", "LINKUSDT", "DOTUSDT", "ARBUSDT", "OPUSDT", "LSKUSDT"]
 SPOT_TAKER = 0.001          # 0.1% per leg (matches backtest.TAKER_FEE)
 FUTURES_TAKER = 0.0005      # 0.05% per leg (matches backtest.FUTURES_TAKER_FEE)
@@ -67,15 +72,54 @@ def latest_funding(symbol):
         return 0.0
 
 
-def equity_from_db():
-    """The engine's own equity view: live DB risk_state.total_equity."""
-    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "trading.db")
+DB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "trading.db"
+)
+
+
+def _risk_state_value(key):
+    """One raw risk_state value from the engine's DB, or None (read-only)."""
     try:
-        db = sqlite3.connect(db_path)
-        row = db.execute("SELECT value FROM risk_state WHERE key='total_equity'").fetchone()
-        return float(row[0]) if row else None
+        db = sqlite3.connect(DB_PATH)
+        try:
+            row = db.execute(
+                "SELECT value FROM risk_state WHERE key=?", (key,)
+            ).fetchone()
+        finally:
+            db.close()
+        return row[0] if row else None
     except Exception:
         return None
+
+
+def equity_from_db():
+    """The engine's own equity view: live DB risk_state.total_equity."""
+    try:
+        row = _risk_state_value("total_equity")
+        return float(row) if row else None
+    except Exception:
+        return None
+
+
+def watched_symbols_from_db():
+    """The engine's LIVE watched pairs (trade_logic.update_symbols ->
+    risk_state.monitored_symbols: screener picks + STATIC_SYMBOLS + any symbol
+    with an open trade).
+
+    The CLI defaults to these for the same reason status.py passes them in: the
+    engine runs DYNAMIC_SYMBOLS, so DEFAULT_PAIRS is a different universe from
+    the one being traded. [] when unavailable; callers fall back.
+    """
+    raw = _risk_state_value("monitored_symbols")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(s).upper() for s in parsed if s]
 
 
 def config_core():
@@ -88,13 +132,21 @@ def config_core():
 def compute_roadmap(equity, pairs=None, include_prices=True):
     """Roadmap as DATA (for status.py / the web monitor).
 
+    `pairs` is the CALLER'S symbol list: status.py passes the engine's live
+    watched set (trade_logic.update_symbols -> risk_state.monitored_symbols), so
+    every figure describes the pairs the bot is actually trading. DEFAULT_PAIRS
+    applies only when the caller has no list (engine predates the field, or its
+    watchlist is empty), and `pairs_source` reports which of the two was used so
+    the card never presents a fallback list as the live one.
+
     Network reads (exchangeInfo floors, prices, funding) are cached by the
     caller when called often. Returns a JSON-safe dict:
       {equity, risk_per_trade, sl_percent, proven_notional, implied_leverage,
        pairs: [{symbol, price, floor, ok, funding_rate}], ok_pairs, blocked_pairs,
-       stages: [{threshold, label, reached}], fee_edge_pct}
+       stages: [{threshold, label, reached}], fee_edge_pct, pairs_source}
     """
-    pairs = [p.strip().upper() for p in (pairs or DEFAULT_PAIRS) if p.strip()]
+    requested = [p.strip().upper() for p in (pairs or []) if p and p.strip()]
+    pairs = requested or list(DEFAULT_PAIRS)
     risk, sl_pct, lev_cfg = config_core()
     floors = futures_floors(set(pairs))
     prices = futures_prices(set(pairs)) if include_prices else {}
@@ -138,6 +190,7 @@ def compute_roadmap(equity, pairs=None, include_prices=True):
         "blocked_pairs": blocked_pairs,
         "stages": stages,
         "fee_edge_pct": round((SPOT_TAKER - FUTURES_TAKER) * 2 * 100, 3),
+        "pairs_source": "engine-watchlist" if requested else "default",
         "generated_ms": int(time.time() * 1000),
     }
 
@@ -145,10 +198,23 @@ def compute_roadmap(equity, pairs=None, include_prices=True):
 def main():
     ap = argparse.ArgumentParser(description="Capital roadmap (read-only, live exchange data)")
     ap.add_argument("--equity", type=float, default=None, help="override account equity (USDT)")
-    ap.add_argument("--pairs", default=",".join(DEFAULT_PAIRS), help="comma-separated futures pairs")
+    ap.add_argument(
+        "--pairs",
+        default=None,
+        help="comma-separated futures pairs (default: the engine's live watched "
+        "set from the DB, else capital_roadmap.DEFAULT_PAIRS)",
+    )
     args = ap.parse_args()
 
-    pairs = [p.strip().upper() for p in args.pairs.split(",") if p.strip()]
+    if args.pairs:
+        pairs = [p.strip().upper() for p in args.pairs.split(",") if p.strip()]
+        pairs_source = "--pairs"
+    else:
+        pairs = watched_symbols_from_db()
+        pairs_source = "engine watchlist (risk_state.monitored_symbols)"
+        if not pairs:
+            pairs = list(DEFAULT_PAIRS)
+            pairs_source = "DEFAULT_PAIRS (engine watchlist empty)"
     risk, sl_pct, lev_cfg = config_core()
     equity = args.equity if args.equity is not None else equity_from_db()
     if equity is None:
@@ -165,6 +231,7 @@ def main():
     print(f"CAPITAL ROADMAP — equity ${equity:.2f} | RISK_PER_TRADE={risk:.3f} SL={sl_pct*100:.1f}%")
     print(f"proven sizing implies notional ${proven_notional:.2f}/trade "
           f"(implied leverage {proven_notional/equity:.2f}x on equity)")
+    print(f"pairs ({len(pairs)}) from {pairs_source}: {', '.join(pairs)}")
     print("=" * 78)
     print(f"{'pair':10} {'price':>10} {'floor$':>7} {'ok?':>4} {'wallet%':>8} {'liq@lev':>9} {'funding/8h':>11}")
     ok_pairs, blocked_pairs = [], []
@@ -198,7 +265,7 @@ def main():
     stages = []
     # equity needed so proven sizing clears a floor: floor * SL% / RISK%
     stages.append((min_floor * sl_pct / risk,
-                   f"lowest-floor pairs (${min_floor:.0f}) tradable at proven 1% risk"))
+                   f"lowest-floor pairs (${min_floor:.0f}) tradable at proven {risk:.1%} risk"))
     stages.append((max_floor * sl_pct / risk,
                    f"highest-floor watched pair (${max_floor:.0f}) tradable — ALL pairs OK"))
     stages.append((100.0, "legacy '$100 floor' assumption satisfied; every perp tradable"))

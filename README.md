@@ -105,8 +105,8 @@ ultimate_bot/
 │
 ├── src/                          # ── React dashboard ───────────────────────────────
 │   ├── main.tsx                  # React 19 createRoot + StrictMode
-│   ├── App.tsx        (1147)     # state hub: WS + polling, config sanitizer, tab routing
-│   ├── types.ts        (377)     # the engine↔UI contract: 21 exported types/interfaces
+│   ├── App.tsx        (1174)     # state hub: WS + polling, config sanitizer, tab routing
+│   ├── types.ts        (416)     # the engine↔UI contract: 22 exported types/interfaces
 │   ├── index.css       (101)     # design tokens, tabular numerals, card primitive, a11y
 │   ├── vite-env.d.ts
 │   ├── components/               # 15 components, one responsibility each
@@ -130,14 +130,14 @@ ultimate_bot/
 │       └── vpsSocket.ts    (178) # WebSocket client: backoff, keepalive, polling fallback
 │
 ├── tests/smoke/
-│   └── dashboard.test.tsx (374)  # 12 SSR tests: desk sections, tabs, edge states
+│   └── dashboard.test.tsx (438)  # 15 SSR tests: desk sections, tabs, edge states, loop/pause
 │
 └── ultimate-bot/                 # ── Python engine ─────────────────────────────────
     ├── main.py            (274)  # async entrypoint: boot, wiring, loops, graceful shutdown
     ├── config.py          (398)  # preset + .env loader + ~60 boot-time validations
-    ├── status.py         (3394)  # CLI dashboard, HTML fallback, HTTP + WS monitor, tuning API
-    ├── backtest.py        (596)  # replay the strategy on real klines (fee/minNotional honest)
-    ├── capital_roadmap.py (231)  # growth stages vs live futures floors (read-only)
+    ├── status.py         (3629)  # CLI dashboard, HTML fallback, HTTP + WS monitor, tuning API
+    ├── backtest.py        (634)  # replay the strategy on real klines (fee/minNotional honest)
+    ├── capital_roadmap.py (298)  # growth stages vs live futures floors (read-only, engine's own pairs)
     ├── ecosystem.config.cjs       # PM2: ultimate-bot + bot-web-monitor (with crash-loop guard)
     ├── futures_soak.sh     (68)  # opt-in 24h futures paper soak launcher (PM2)
     ├── soak_watchdog.py   (322)  # supervises a soak: deadline summary, death/stall alerts
@@ -148,8 +148,8 @@ ultimate_bot/
     ├── probes & tests
     │   ├── check_env_drift.py   (302)  # fails when .env and .env.example diverge (--update re-mirrors)
     │   ├── smoke_test.py        (412)  # 13 checks: boot, lock, API, SIGTERM cleanup
-    │   ├── sync_test.py         (521)  # 27 checks: engine ↔ monitor end-to-end sync
-    │   ├── test_scenarios.py    (157)  # offline failure battery S1–S7
+    │   ├── sync_test.py         (799)  # 46 checks: engine ↔ monitor end-to-end sync (position mark, heartbeat, roadmap pairs)
+    │   ├── test_scenarios.py    (315)  # offline failure battery S1–S9
     │   ├── test_futures_reconcile.py (120)  # futures reconcile reads positionAmt, not wallet
     │   ├── live_signed_probe.py (242)  # go-live credential/signature/clock check (no orders)
     │   ├── order_dry_run_probe.py (537)# builds real orders through all 4 clients, sends none
@@ -177,7 +177,7 @@ ultimate_bot/
         │   └── risk_manager.py     (555)  # equity, sizing, breaker, streaks, cooldowns, publish
         ├── trade/
         │   ├── order_manager.py    (265)  # sanitize → place → confirm fills
-        │   └── trade_logic.py     (1666)  # the runtime: entries, exits, reconciliation, reports
+        │   └── trade_logic.py     (1749)  # the runtime: entries, exits, reconciliation, reports
         ├── database/
         │   └── db_manager.py       (192)  # WAL SQLite, async write queue, read helpers
         ├── reporting/
@@ -302,12 +302,16 @@ Rejected: 15m RSI buckets and 3+ entries/day (failed the same battery).
 ```
 
 The backtest and the engine share the same decision code, so re-run it after any strategy
-change (see [§11](#11-verification--test-matrix)).
+change (see [§11](#11-verification--test-matrix)). Since 2026-09-22 it also resolves configuration the
+way the engine does (`.env` overrides the preset), so a bare run measures the config that is actually
+trading rather than the preset.
 
 > ⚠️ **The deployed `.env` overrides 8 of these preset keys** — `RSI_TIMEFRAME`, `RSI_PERIOD`,
 > `REGIME_EMA`, `REGIME_SLOPE_DAYS`, `MTF_TIMEFRAME`, `MAX_TRADES_PER_DAY`,
 > `BREAKEVEN_ENABLED` and `CLOSE_AT_UTC_DAY_END` — so the *running* strategy is not
-> byte-for-byte the validated preset. See [§15](#15-repository-audit--current-findings) item 1.
+> byte-for-byte the validated preset. Now that the backtest resolves config the same way, the two can
+> be compared on one window: the preset returns **+0.41% / PF 1.02**, the deployed config
+> **−7.80% / PF 0.73**. See [§15](#15-repository-audit--current-findings) item 1.
 
 ---
 
@@ -331,6 +335,34 @@ change (see [§11](#11-verification--test-matrix)).
 | Funding gate | `trade_logic` (futures) | Skips longs paying more than `FUNDING_RATE_MAX` per interval |
 | Crash-loop breaker | `ecosystem.config.cjs` | `max_restarts: 5` / `min_uptime: 30s`, so a bad `.env` shows as `errored` |
 | Graceful shutdown | `main.py` | Signal handlers set flags; tasks wind down; lock always released |
+
+### 5.1 Spot vs. futures
+
+The strategy is market-agnostic: `SignalGenerator.decide()`, the `trade_policy` helpers
+(`effective_bracket`, `effective_stop`, `ratchet_stops`, `scale_out_plan`) plus the shared exit decision
+`evaluate_exit`, and `trend_detector` contain **no** `MARKET` branch, and there is one `.env` for both
+venues. Only three shared files branch on it —
+`trade_logic` (11 sites), `order_manager` (8) and `risk_manager` (1 — its equity source).
+
+| | Spot | Futures |
+|---|---|---|
+| Entry margin check | free quote ≥ notional | free quote ≥ notional / leverage |
+| Extra entry gate | — | funding rate (`FUNDING_RATE_MAX`) |
+| Exit quantity source | free base-asset balance | `positionAmt` |
+| Exit flag | `reduce_only` accepted and ignored | `reduceOnly=true` on every SELL |
+| Equity source | per-asset wallet sums | `totalMarginBalance` (includes unrealised PnL) |
+| Fee model | 0.1% per leg | 0.05% per leg |
+| Exit PnL check | — | cross-checked against `userTrades`, self-healing |
+| Reconcile source | wallet balance | `positionRisk` |
+| Orphan cleanup | `/api/v3/openOrders` | `/fapi/v1/allOpenOrders` |
+| Market data | `stream.binance.com` | `fstream` + REST ticker fallback |
+
+Same signal, same bracket, same exit policy on both venues — futures simply takes **fewer** entries,
+because it applies two gates spot does not have (funding, and margin rather than full notional). One gap
+remains in [ultimate-bot/README.md](./ultimate-bot/README.md#-spot-vs-futures-shared-logic--divergences):
+futures paper mode returns the simulated fill before `is_futures` is computed, so it never exercises the
+futures order path. The funding gate, by contrast, is now implemented in `backtest.py` as well and is
+reachable from the CLI via `--market futures`.
 
 ---
 
@@ -359,16 +391,26 @@ can't start a PM2 crash loop). Includes a **drift guard** warning when an explic
   status push plus log tails.
 - `start_web_server` — the HTTP handler: SPA fallback, gzip, ETag/304, Range, keep-alive.
 - `render_dashboard` + `get_standalone_html` — the no-`dist/` fallback UI.
-- `capital_roadmap.compute_roadmap` is imported **lazily** inside the payload build.
+- `capital_roadmap.compute_roadmap` is imported **lazily** inside the payload build, and is
+  handed the engine's watched pairs (`risk_state.monitored_symbols`) — the same value served as
+  `monitored_symbols`, read once per payload, so the two cannot describe different universes.
 
-**`backtest.py`** — replays the real strategy on real klines (`--pages` × 1000 bars) with
-honest taker fees and the exchange's real minNotional. `market="futures"` uses fapi klines,
-0.05%/leg and real historical funding. Imports `trade_policy` so live and backtest exits
-cannot diverge.
+**`backtest.py`** (634 lines) — replays the real strategy on real klines (`--pages` × 1000 bars) with
+honest taker fees and the exchange's real *per-symbol* minNotional. `--market futures` (or
+`BACKTEST_MARKET=futures`) switches to fapi klines, 0.05%/leg, real historical funding charged at each
+8 h settlement, and the same `FUNDING_RATE_MAX` entry gate the engine applies — blocked entries are
+reported as `funding_gate_skips`. Configuration resolves exactly like the engine (env-first), so a bare
+run measures the deployed `.env`. Imports the shared `SignalGenerator.decide()` and `trade_policy`
+helpers.
 
 **`capital_roadmap.py`** — read-only: fetches live futures floors, prices and funding, then
-computes growth stages and per-pair viability. Serves both the CLI (`--equity`) and the
-dashboard's Roadmap panel.
+computes growth stages and per-pair viability. Serves both the CLI (`--equity`/`--pairs`) and the
+dashboard's Roadmap panel, and **both analyse the engine's live watched pairs** —
+`risk_state.monitored_symbols`, written by `trade_logic.update_symbols` (screener picks +
+`STATIC_SYMBOLS` + any symbol holding an open trade) — rather than a list committed to the module.
+`DEFAULT_PAIRS` is only the fallback for when the engine has published none, `pairs_source` records
+which was used, and the stage thresholds therefore track the watched set: the binding constraint is
+the highest floor *among the pairs actually being traded*.
 
 **`soak_watchdog.py` / `futures_soak.sh` / `soak_report.py`** — opt-in 24 h futures paper
 soak: isolated DB and control file, its own PM2 app, a watchdog that posts a deadline summary
@@ -397,7 +439,7 @@ fresh timestamp, `positionSide=BOTH`, exit `reduceOnly=true` — **nothing is tr
 | Module | Role |
 |---|---|
 | `signal_generator.py` | `generate_signal(symbol)` fetches daily + execution-TF candles and calls the pure `decide()` core: regime gate, RSI dip, optional quality gates. `_record()` stores each decision for the UI. |
-| `trade_policy.py` | `effective_bracket`, `effective_stop`, `scale_out_plan/price`, `ratchet_stops`, `bar_exit` — the shared exit maths. |
+| `trade_policy.py` | `effective_bracket`, `effective_stop`, `scale_out_plan/price`, `ratchet_stops`, and `evaluate_exit` — the **ONE exit decision** both the engine and the backtest call, plus the shared level maths. |
 | `trend_detector.py` | The dynamic screener: 4-factor Z-scores (volume / 24 h change / volatility / ADX) with a correlation penalty, plus in-place price refresh between rescans. |
 
 ### 6.4 `risk/` and `trade/`
@@ -452,7 +494,7 @@ health/balance snapshots and the daily report loop.
 | `VpsConnectionBar` | `vpsStatus`, `vpsEndpoint`, `onUpdateVpsEndpoint`, `onRefreshVps`, `isPolling`, `controlPaused`, `onToggleVpsPause`, `wsTransport` | Endpoint control, transport indicator, manual refresh, pause/resume, hosts `SyncClock`. |
 | `SyncClock` | clock props | Live engine↔browser clock and payload age — proves the link is real, not cached. |
 | `LiveDashboard` | 40 props (equity, PnL, trades, symbols, candidates, config, callbacks, risk, futures, roadmap, soak) | The desk. Contains `BracketLadder`, `Kpi`, `ExitedCell` and the formatters (`formatPrice`, `formatHoldTime`, `holdCell`). |
-| `EngineHealthCard` | engine/transport state | "Is everything actually working?" — transport lights, decision-loop cadence, exchange clock sync. |
+| `EngineHealthCard` | engine/transport state | "Is everything actually working?" — transport lights, the engine's **loop heartbeat** (not the signal-snapshot age, which freezes legitimately while paused or fully invested), the applied-vs-requested pause state, and exchange clock sync. |
 | `StatusCards` | 4 exports | `StreamLights`, `FuturesPanel`, `RoadmapCard`, `FuturesSoakCard` — realtime transports, futures account, capital roadmap, soak health. |
 | `DynamicScreener` | `candidates`, `config`, `onInspectSymbol` | Ranked candidates with the factor breakdown that produced the ranking. |
 | `TuningControlBar` | `config`, `onUpdateConfig`, `onApplyPreset`, `onCloseAllTrades`, `onOpenVpsSync`, `activeTradesCount`, `vpsConnected`, `controlPaused`, `onToggleVpsPause` | The live tuner + emergency controls. |
@@ -559,13 +601,34 @@ the directory instead with `git config core.hooksPath .githooks`.
 | `/api/config` | POST | Whitelisted, type-validated `.env` writes (the tuner push) |
 | `/ws` | WS | RFC 6455. Sends a `hello` snapshot, then a ~1 s coalesced status push plus log tails |
 
-**`/api/status` payload** — 87 config keys and 23 top-level sections (`account`, `balance`,
-`candidates`, `config`, `control`, `data`, `futures`, `market`, `mode`, `monitored_symbols`,
-`open_positions`, `paper_trade`, `process`, `roadmap`, `scanned_pairs`, `server_epoch_ms`,
-`server_time`, `server_time_utc`, `signal_state`, `soak`, `timestamp`, `untracked_pnl`,
-`ws_streams`). The nested `data` object carries `stats`, `risk`, `trades`, `orders`,
-`signal_state`, `ws_streams`, `monitored_symbols`, `scanned_pairs`, `balance`, `futures`,
-`untracked_pnl`, `mode`, `soak`.
+**`/api/status` payload** — 87 config keys and 29 top-level sections (`account`, `balance`,
+`candidates`, `config`, `control`, `data`, `futures`, `loop_state`, `market`, `mode`,
+`monitored_symbols`, `open_positions`, `paper_trade`, `positions_age_s`, `positions_live`,
+`positions_pnl`, `positions_tracked`, `positions_untracked`, `process`, `roadmap`,
+`scanned_pairs`, `server_epoch_ms`, `server_time`, `server_time_utc`, `signal_state`,
+`soak`, `timestamp`, `untracked_pnl`, `ws_streams`). The nested `data` object carries
+`stats`, `risk`, `trades`, `orders`, `signal_state`, `ws_streams`, `loop_state`,
+`monitored_symbols`, `scanned_pairs`, `balance`, `futures`, `untracked_pnl`, `positions_pnl`,
+`mode`, `soak`.
+
+**Active-position sync** — every row in `data.trades` is the engine's persisted management
+state (stops, targets, trail, locks, size, scale-out) stamped with the engine's own live
+position numbers: `current_price`, `unrealized_pnl`, `live_qty`, `position_source`
+(`engine-futures` / `engine-scan` / `engine` / `db`), `position_age_s`, `position_stale`. The mark comes
+from `risk_state.futures_state` or, failing that, the screener's prices — never from the
+browser and never from a monitor-side exchange call. So "Entry → Now", the change %, the
+Unrealized column and the bracket-ladder marker always describe the position the engine is
+managing. `open_positions` is `tracked ∪ live`, `untracked_pnl` covers only exchange positions with no
+tracking row, and `positions_pnl` is the fresh total floating PnL across the engine's live
+positions. Full contract in the engine README's *Active-position sync*.
+
+**Loop liveness & the control channel** — the engine writes a `loop_state` heartbeat once per
+iteration on **every** path (trading / paused / health-pause), served with an `age_s`. The
+dashboard's *Decision loop* light reads that, not the age of the newest per-symbol signal
+snapshot — that snapshot only advances when a symbol gets past every gate, so pausing or holding
+a full book used to freeze it while the engine was healthy. The heartbeat also carries
+`paused_requested` / `paused_applied`, so the UI shows *pause requested…* until the engine has
+actually applied the pause instead of echoing its own request back as fact.
 
 **Control channel** — two interchangeable paths into the same state: `POST /api/control` (what
 the dashboard buttons use) and the control file `data/engine_control.json` (or `CONTROL_FILE`),
@@ -615,18 +678,18 @@ All commands run from the repo root unless noted. `npm run smoke` and friends ha
 |---|---|---|---|
 | **Config drift** | `npm run check:env` | `.env` vs `.env.example`: keys present in only one file, duplicate keys, inline `#` comments on value lines, value drift, and that no real credential has reached the template | **IN SYNC** |
 | Engine smoke | `npm run smoke` | Boot, single-instance lock, second-instance rejection, web-monitor stats consistency, clean SIGTERM shutdown and lock release (isolated temp DB) | **13/13** |
-| Sync integration | `npm run test:sync` | Engine ↔ monitor end-to-end: real engine boot, `/api/status` + `/ws` payload, streaks, control channel, DB↔UI agreement | **27/27** |
-| Failure scenarios | `./venv/bin/python3 ultimate-bot/test_scenarios.py` | Offline battery S1–S7 (incl. S6 order-routing `reduce_only` contract, S7 multi-assets balance seed) | **ALL OK** |
+| Sync integration | `npm run test:sync` | Engine ↔ monitor end-to-end: real engine boot, `/api/status` + `/ws` payload, streaks, control channel, DB↔UI agreement, **active-position sync** (E2: the served row carries the engine's mark/uPnL/size, per-position leverage/margin normalised, untracked positions counted not double-counted), **loop heartbeat + pause acknowledgement** (B1), **roadmap watchlist** (E3: `roadmap.pairs` == the served `monitored_symbols`, ok/blocked partition the watched set, a rotation invalidates the cache) | **46/46** |
+| Failure scenarios | `npm run test:scenarios` | Offline battery S1–S9 (incl. S6 order-routing `reduce_only` contract, S7 multi-assets balance seed, **S8 the shared exit decision** — ordering, reason labels, gap-aware fills, **S9 active-trade persistence** — flush on change, heartbeat, DB-failure tolerance) | **ALL OK** (40 checks, S8: 13, S9: 8) |
 | Futures reconcile | `./venv/bin/python3 ultimate-bot/test_futures_reconcile.py` | Reconcile reads `positionAmt`, not wallet balance | **ALL OK** |
-| Dashboard UI | `npm run test:ui` | 12 SSR tests: 6 desk sections, bracket ladder, breaker, cooldown, flat state, engine stats, screener empty state, untracked PnL, futures chip, **app shell (5 tabs)**, tab bodies | **12/12** |
+| Dashboard UI | `npm run test:ui` | 16 SSR tests: 6 desk sections, bracket ladder, breaker, cooldown, flat state, engine stats, screener empty state, untracked PnL, futures chip, **stale-position flag**, **loop-heartbeat source**, **pause acknowledgement**, **roadmap universe label**, **app shell (5 tabs)**, tab bodies | **16/16** |
 | Typecheck | `npm run lint` | `tsc --noEmit` across all TS/TSX | **clean** |
 | Credentials | `npm run probe` | Sign+verify self-test, connectivity, clock offset, signed account read (no orders) | exit 0 = go |
 | Order builders | `npm run probe:orders` | All 4 clients build a valid order (stubbed transport, nothing sent) | exit 0 = go |
-| Backtest | `./venv/bin/python3 ultimate-bot/backtest.py --symbol NEARUSDT --pages 30 --quiet` | Strategy edge on fresh data vs the validated baseline | **+7.11% / PF 2.06** |
+| Backtest | `./venv/bin/python3 ultimate-bot/backtest.py --symbol NEARUSDT --pages 30 --quiet` | Strategy edge on fresh data, resolved against the **deployed `.env`** | **−7.80% / PF 0.73** (preset values, same window: +0.41% / PF 1.02) |
 
 The smoke/sync suites use isolated temp DBs and never touch the real `trading.db`.
 `npm run verify` chains the whole battery (`lint` → `check:env` → `smoke` → `test:ui` →
-`test:sync`) in one command, and the versioned pre-commit hook
+`test:sync` → `test:scenarios`) in one command, and the versioned pre-commit hook
 (`npm run hooks:install`) runs the drift check on every commit.
 
 ---
@@ -705,7 +768,22 @@ Re-audited on 2026-09-22 (every tracked file, every function, both languages).
   package is used.
 - **No temporary files:** zero `__pycache__`, `*.pyc`, `.tmp/.bak/.orig/.rej/*~`,
   `.DS_Store`, `.tsbuildinfo` or `.swp` artifacts.
+- **No unreachable code:** an AST scan of every function body in the Python tree finds no statement
+  following a `return`/`continue`/`raise` (a 7-line duplicated block in `backtest.py` was found this
+  way in the 2026-09-22 audit and removed).
 - **No credential exposure in the monitor** (see [§12](#12-security--secrets)).
+- **No stale position state in the monitor:** every served row of `data.trades` is joined to the
+  engine's own published position snapshot (mark/uPnL/exchange size) and comes with an age and a
+  staleness flag, and the engine now flushes a managed trade to SQLite on every real change rather
+  than inside a one-second window per 30 s. Guarded by `sync_test.py` **E2** and
+  `test_scenarios.py` **S9**.
+- **Liveness is reported by the engine, not inferred:** an engine→monitor audit of every published
+  field found the *Decision loop* light measuring the age of the newest per-symbol signal snapshot —
+  which only advances when a symbol gets past every gate, so **pausing the bot from the dashboard,
+  or holding a full book, made a healthy engine report a wedged loop**. The engine now writes a
+  `loop_state` heartbeat once per iteration on every path, the pause is *acknowledged* rather than
+  echoed, and the fields that are change-driven (and therefore must never be read as heartbeats)
+  are documented in the engine README. Guarded by `sync_test.py` **B1** and two new UI tests.
 - **No config drift:** `.env` and `.env.example` share all **90 keys with zero drift** (the
   only differences are the three credential keys, which keep placeholders). Nine keys
 disagreed before the 2026-09-22 reconciliation recorded in the changelog.
@@ -717,9 +795,9 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 **Watch these**
 
-1. **The deployed config overrides the `intraday_rsi` preset on 8 strategy keys.** The preset
-   is what §4 documents and what the provenance battery validated, but the live `.env` wins
-   wherever it sets a key — and it sets these:
+1. **The deployed config overrides the `intraday_rsi` preset on 8 strategy keys — and it is now
+   measurable.** The preset is what §4 documents and what the provenance battery validated, but the
+   live `.env` wins wherever it sets a key — and it sets these eight:
 
    | Key | Preset (validated) | Live `.env` |
    |---|---|---|
@@ -733,11 +811,33 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
    | `CLOSE_AT_UTC_DAY_END` | `true` | `false` |
 
    These may be deliberate operator choices — the engine is the one trading — but they mean the
-   running strategy is **not** the exact configuration behind +10.77% / PF 1.43. Change them
-   only against a fresh backtest (GO_LIVE.md step 5.3): a 15m `RSI_TIMEFRAME` was already
-   measured turning the validated +7.11% into −16.5% through fee drag.
-2. **`npm run clean` references a `server.js`** that no longer exists (left over from the
-   original scaffold). Harmless (`rm -rf`), cosmetic.
+   running strategy is **not** the configuration behind +10.77% / PF 1.43. Since the audit fixed the
+   backtest's config resolution, the two can be compared on an **identical window** (NEARUSDT, 30 pages
+   ≈ 104 days, $22 equity, run 2026-09-22):
+
+   | Config | Return | Trades | WR | PF | Expectancy | Fees | Max DD |
+   |---|---|---|---|---|---|---|---|
+   | Preset (validated values) | **+0.41%** | 56 | 52% | **1.02** | +0.07 | 92.6 | 7.6% |
+   | Deployed `.env` | **−7.80%** | 58 | 55% | **0.73** | −1.34 | 90.7 | 10.3% |
+
+   Same window, same fee model, same signal code: the deployed overrides are worth roughly **8 points
+   of return and 0.29 of profit factor**. Neither figure is the historic +10.77% — the preset itself has
+   degraded on recent data — but the deployed config is the weaker of the two, and it is the one trading.
+   Re-tune or revert only against a fresh backtest (GO_LIVE.md step 5.3): a 15m `RSI_TIMEFRAME` was
+   already measured turning the validated +7.11% into −16.5% through fee drag.
+2. **Backtest↔live parity: the exit decision is now literally shared.** Fixed 2026-09-22/23 — the
+   backtest resolves config **env-first** exactly like `config.load_config()` (verified at zero
+   differences across every non-credential key), it applies the `FUNDING_RATE_MAX` **entry gate** so a
+   futures backtest can no longer take an entry the engine refuses, the futures mode is wired to
+   `--market {spot,futures}`, and since 2026-09-23 `trade_policy.evaluate_exit` is the **single** exit
+   decision — the same call `manage_trade` makes every poll — with one ordering (stop → take-profit →
+   time stop → day-end → +R scale-out), comparable reason labels and gap-aware fills on both sides. The
+   old `bar_exit`, called by nothing but the backtest, is gone, and the trailing stop is fed the same
+   favourable extreme by both. Still different, and documented rather than hidden: **sampling
+   granularity** (a 10 s tick plus the last two klines vs one completed bar, and no wall clock in a
+   replay), the exchange's `stepSize`/`minQty` quantisation and free-quote haircut in sizing, and
+   backtest fills that are spread-, slippage- and latency-free. Full table in
+   [ultimate-bot/README.md § Backtest vs. Live](./ultimate-bot/README.md#-backtest-vs-live-verified-parity-divergences).
 3. **Port `:3000` is claimed by two things** — `npm run dev` and `status.py --web`. Only one
    can run at a time.
 4. **`data/` and `logs/` were deliberately retained** — they hold the running engine's live
@@ -749,6 +849,158 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 Newest first. Entries marked **⚙️ engine** carry deeper detail in
 [ultimate-bot/README.md](./ultimate-bot/README.md).
+
+### 2026-09-23 (4) — The Capital Roadmap analyses the pairs the engine actually trades
+- **The card described a different universe from the one being traded.** `capital_roadmap.DEFAULT_PAIRS` was a six-symbol literal (`NEAR/LINK/DOT/ARB/OP/LSK`) compiled into the module, while the engine runs `DYNAMIC_SYMBOLS=true` and the screener rotates `MAX_SYMBOLS` picks every cycle. The panel therefore reported floors for pairs the bot was not watching and omitted the ones it was: the live book's binding constraint — **BCHUSDT's $20 floor** against a proven $19.69 notional — was invisible, because BCHUSDT is not a default pair. Both surfaces now take the **engine's live watched set** (`risk_state.monitored_symbols`, written by `trade_logic.update_symbols`: screener picks + `STATIC_SYMBOLS` + any symbol holding an open trade): `status.py` reads it once per payload (`_engine_watched_symbols`) and passes it to `compute_roadmap(pairs=…)`, and the CLI defaults `--pairs` to the same DB row. `DEFAULT_PAIRS` survives only as the fallback when the engine has published nothing, and the new **`pairs_source`** field says which was used — the card never presents a fallback list as the live one.
+- **A rotated watchlist invalidates the 10-minute cache.** The cached exchange data (floors, prices, funding) belongs to *specific* symbols, so the cache is now keyed on the watched set and recomputed the moment it changes, instead of reporting dropped pairs — and missing newly-picked ones — for up to ten more minutes. The card header states the universe and its size: `5 engine-watched pairs · live exchange floors · computed 42s ago`.
+- **Stage thresholds follow the watched set**, which is the honest reading of the question: the binding constraint is the highest floor among the pairs being traded, not among an arbitrary list. Verified against the live engine's own selection — 4 of 5 watched pairs clear, BCHUSDT does not.
+- **CLI output corrected while touching it:** the stage label hardcoded `proven 1% risk` (now prints the configured `RISK_PER_TRADE`), the header prints the pair source, and `equity_from_db` / the new `watched_symbols_from_db` share one read-only `risk_state` reader.
+- **Verification:** new **E3** in `sync_test.py` (**46/46**) — the served `roadmap.pairs` equals the served `monitored_symbols`, ok/blocked partition the watched set against the served proven notional, and a rotation invalidates the cache; stubbed exchange data against a private DB copy, so it needs no network and cannot disturb the serving monitor. One new UI test pinning the universe label (**16/16**); scenarios **40/40**, smoke **13/13**, `tsc --noEmit` clean, `check:env` IN SYNC.
+
+### 2026-09-23 (3) — Engine→monitor field audit: loop liveness, the pause, and the futures fields
+- **A paused engine reported a wedged loop.** The Engine Health panel's *Decision loop* row measured
+  the age of the newest per-symbol signal snapshot, and its tooltip promised "a frozen age means the
+  strategy loop is wedged". That timestamp only advances when a symbol gets **past every gate**
+  (`process_symbol` returns before `generate_signal` for active trades, cooling-down symbols, a full
+  slot list and a tripped breaker, and the pause branch never evaluates symbols at all) — so pausing,
+  or simply holding a full slot list, froze it within one cycle while the engine was healthy. The
+  engine now publishes a `loop_state` heartbeat once per iteration on **every** path (trading /
+  paused / health-pause); the panel reads that, the snapshot age is only a fallback for older
+  engines, and the tooltip changes with the source.
+- **The pause is acknowledged, not echoed.** `control.paused` records what the monitor *asked* for,
+  and the UI displayed that request back as fact. The heartbeat carries `paused_requested` /
+  `paused_applied`, so the chip reads *entries paused* only once the engine has applied it, and
+  *pause requested…* until then.
+- **Futures positions are normalised.** On the common WS-cache path every position arrived with
+  `leverage: null` / `margin_type: null` (the real values are on the snapshot's top level) and no
+  `markPrice` (only the positionRisk fallback has one), so the Futures card showed `1× CROSSED` in
+  its header directly above `—×` for the same position. Both are now filled, and the mark is derived
+  from the published uPnL.
+- **A fresh total floating PnL (`positions_pnl`)**, and `roadmap.age_s` so the 10-minute-cached
+  roadmap states its own age instead of showing an "Equity" cell next to the live one unlabelled.
+- **Documented, deliberately unchanged:** `risk.unrealized_pnl` (engine-persisted, read by nothing in
+  the dashboard), `engine_risk.updated_at` and `signal_state` (change-driven, so **not** heartbeats),
+  `account_balances` (~60 s, standalone page only), and the monitor-computed PM2/soak state.
+- **Verification:** `sync_test.py` **41/41** (new B1 heartbeat + pause acknowledgement, E2
+  normalisation), UI **15/15** (2 new), scenarios **40/40**, smoke **13/13**, `tsc --noEmit` clean,
+  `check:env` IN SYNC.
+
+### 2026-09-23 (2) — The monitor's active position is the engine's active position
+- **The dashboard showed the entry price as the current price.** `active_trades` has no price
+  column, so the served row carried no `current_price` and the UI's `current_price || entryPrice`
+  fallback rendered the entry as "now": **0.00%** change, **$0.00** unrealized, and the
+  bracket-ladder marker parked on the entry — while the engine knew the real mark. `status.py`
+  now joins the engine's **own published state** onto every served row (`risk_state.futures_state`
+  plus the screener's per-symbol prices), adding `current_price`, `unrealized_pnl`, `live_qty`,
+  `position_source`, `position_age_s` and `position_stale`. When the engine publishes a
+  `markPrice` it is used verbatim; otherwise the mark is derived exactly from the published uPnL
+  (`mark = entry + uPnL / amount`, valid for a long or a short). No browser math, no monitor-side
+  exchange call.
+- **The served position state no longer lags the engine.** `manage_trade` flushed a managed trade
+  to SQLite only on `int(time.time()) % 30 == 0` — a one-second window every 30 s that the 10 s
+  decision cadence routinely missed, so a ratcheted trailing stop or a breakeven lock could sit
+  unpublished for minutes while exits were decided from memory. `_persist_active_trade_if_changed()`
+  now writes once per real change, with a 60 s heartbeat, signature cleared on close, and a DB
+  failure downgraded to a warning that retries next cycle.
+- **Counts are explicit:** `positions_tracked` / `positions_untracked` / `positions_live`, with
+  `open_positions = tracked ∪ live`; `untracked_pnl` sums only untracked positions, so a tracked
+  row is never double-counted.
+- **The standalone fallback dashboard** gained **Now** and **Unrealized** columns driven by the
+  same joined mark.
+- **Verification:** new `E2` in `sync_test.py` (8 checks — injects a futures snapshot and asserts
+  the served row carries the engine's mark/PnL/size/provenance, 35/35 total) and new `S9` in
+  `test_scenarios.py` (8 checks — flush on change, no per-cycle churn, heartbeat, DB-failure
+  tolerance, 40/40 total). Plus `tsc --noEmit` clean, smoke 13/13, UI 13/13, `check:env` IN SYNC,
+  and the live futures payload re-read against the real DB. The join's own first draft counted a
+  `NaN` amount as a live position; `_safe_float` now rejects non-finite sizes and derived marks.
+
+### 2026-09-23 — Exit logic unified: one decision function for live and backtest
+
+- **`trade_policy.bar_exit` is gone; `trade_policy.evaluate_exit` replaces it, and the live engine now
+  calls it too.** Trade management was previously shared only at the level-setting helpers: the backtest
+  replayed `bar_exit` per bar while `trade_logic.manage_trade` ran its own three-batch poll loop that
+  ordered the +1R scale-out *before* the stop check and filled a wick stop at `min(stop, low)`. Both now
+  make one call with normalised evidence (live: the wick range of the post-entry klines folded together
+  with the live tick; backtest: the bar's low/high) under one ordering — **stop → take-profit → time
+  stop → day-end flatten → +R scale-out** — so the priority, the labels and the fills cannot drift again.
+- **Parity proof, not a claim:** on one identical NEARUSDT window (30 pages ≈ 104 days) all 59 trades
+  reproduce to the last decimal — same entry, exit price and PnL — the only change being a
+  window-relative index. The refactor moved no fill.
+- **22 of 55 stop-outs were misfiled as `STOP_LOSS` and are now `TRAILING_STOP`.** Exit-reason
+  histograms from the two systems were previously not comparable, because the backtest never emitted
+  `TRAILING_STOP` or `EOD_CLOSE` and recorded its day-end close as `TIME_STOP`. They are now — and the
+  split shows the ATR trail, not the hard stop, closing over a third of all exits.
+- **The trail follows the observed extreme on both sides.** The backtest ratchets at 2×ATR below the bar
+  high; live ratcheted below the bare tick, so its trail lagged the model's. Live now feeds the same
+  wick high. This is the one change that moves live stop levels, and it only ever tightens: the raised
+  trail is always ≥ the old one, so it can exit at the same price or earlier, never looser. It is also
+  the one piece the backtest cannot validate, because it moves live only.
+- **Fills are gap-aware on both sides.** A level already traded through fills at the decision-moment
+  price the caller supplies (the live tick; the bar's open in a replay) instead of at a level the market
+  has left behind. Live's old `min(stop, low)` booked the bottom of the wick — pessimistic past realism.
+- **A failed kline fetch no longer skips the stop check.** Live used to fall through to the time stop
+  and day-end only; it now degrades to tick evidence and still evaluates the stop.
+- **New `S8` contract battery** in `test_scenarios.py` (13 checks: ordering, reason labels, gap-aware
+  fills, armed vs unarmed trail, quiet and absent-evidence windows) — and the battery is finally wired
+  into the standard flow as `npm run test:scenarios` and into `npm run verify`. It existed but nothing
+  ran it.
+- **Verified:** backtest trade list diffed trade-by-trade against the pre-change run · spot and futures
+  paths · forced `SCALE_OUT_ENABLED=true` / `CLOSE_AT_UTC_DAY_END=true` runs (11 partials, 1 `EOD_CLOSE`)
+  · `tsc --noEmit` clean · smoke **13/13** · UI **12/12** · sync **27/27** · scenarios **ALL_OK** ·
+  `check:env` **IN SYNC**. No live parameter was touched, and the running engine keeps executing the
+  previous code until it is reloaded.
+
+### 2026-09-22 (5) — Directory-wide audit: six defects found and fixed
+
+- **Unreachable dead code in `backtest.py`** — a 7-line duplicated exit block sat *after* a `continue`
+  in `run_backtest`, so it could never run. Found with an AST scan for statements following a
+  `return`/`continue`/`raise`, and removed; no other unreachable code exists in the Python tree.
+- **The futures backtest was unreachable from the CLI** — `run_backtest(..., market=...)` existed and
+  `fetch_klines`, the fee model, funding and minNotional all branched on it, but `main()` never passed it
+  and no flag set it, so every documented futures assumption was dead as far as a user was concerned.
+  Added `--market {spot,futures}` with a `BACKTEST_MARKET` env default.
+- **The funding-rate entry gate is now implemented in `backtest.py`** (parity with
+  `trade_logic.enter_trade`): a long whose last settled rate exceeds `FUNDING_RATE_MAX` is skipped, and
+  the run reports `funding_gate_skips`. Verified by forcing the cap to ~0 — 2 entries blocked, 0 trades,
+  `funding_gate_skips=2` — while the same cap under `--market spot` changes nothing, as it should.
+- **Config precedence fixed (the important one)** — `backtest.run_backtest` applied the preset *on top
+  of* `load_config()`, so a bare run validated the preset while the engine ran `.env`; on this repo that
+  was 8 strategy keys apart. It now selects the preset through `PRESET` and loads normally, which is
+  env-first, exactly like the engine. This is what makes the comparison in
+  [§15](#15-repository-audit--current-findings) item 1 possible.
+- **`backtest.py` docstring corrected** — it claimed the futures `NOTIONAL.minNotional` floor "defaults
+  to 100 USDT (futures reality)"; the code reads the real per-symbol fapi value (5 USDT on most USDT
+  perps, which the module docstring already said).
+- **`npm run clean` no longer references the deleted `server.js`** — it was `rm -rf dist server.js`, and
+  that file has not existed since the original scaffold was removed.
+- **Swept clean, no action needed:** `compileall` across the whole engine · `tsc --noEmit` · `node --check`
+  on `ecosystem.config.cjs` and `ui_smoke.mjs` · `bash -n` on both shell scripts · zero
+  `TODO`/`FIXME`/`HACK` · zero `eval`/`exec`/`os.system`/`shell=True`/`pickle.load` · zero mutable default
+  arguments · all SQL parameterised (the interpolated `fields` in `update_order_status` are literal
+  column names, never user input) · all 9 `requirements.txt` pins map 1:1 to real imports · no dead
+  exports or orphan components across the 21 TS/TSX files · nothing tracked that should not be
+  (`dist/`, `node_modules/`, `venv/`, `logs/`, `data/`, `.env`, `*.pem`, `*.db` all ignored and untracked).
+
+### 2026-09-22 (4) — Spot/futures and backtest↔live parity documented; 13 divergences audited
+
+- **New [§5.1](#51-spot-vs-futures)** documents the two-venue split: the signal layer, the `trade_policy`
+  level helpers and the screener contain **zero** `MARKET` branches, and only `trade_logic` (11 sites),
+  `order_manager` (8) and `risk_manager` (1) branch on it at all. Same signal and same bracket on both
+  venues; futures takes fewer entries because it adds a funding gate and a margin-based (not notional)
+  entry check.
+- **§15 gained a watch item for backtest↔live parity** — a full audit of both paths found 13 places they
+  can disagree. The largest: `config.load_config()` is env-first, but `backtest.run_backtest` applies the
+  preset on top of it, so a bare `backtest.py` reproduces the **preset**, not the deployed `.env`
+  (8 strategy keys differ). Also verified: `trade_policy.bar_exit` is called by nothing but the backtest —
+  live's `manage_trade` runs its own loop and orders the +1R scale-out ahead of the stop/TP check; the
+  backtest never applies the funding gate; sizing skips the exchange's `stepSize`/`minQty` quantisation
+  and the free-quote haircut; the daily breaker ignores unrealised PnL; and every backtest fill is
+  slippage- and spread-free.
+- **Deep dive** in [ultimate-bot/README.md](./ultimate-bot/README.md) — two new sections
+  (*Spot vs. Futures: Shared Logic & Divergences*, *Backtest vs. Live: Verified Parity Divergences*) with
+  the full 13-row table, a runnable config-precedence reproduction, and corrections to the two claims
+  this audit disproved (that trade management is "identical", and that a bare backtest reproduces the
+  deployed `.env`). No engine or backtest code was changed.
 
 ### 2026-09-22 (3) — Automated config-drift guard
 

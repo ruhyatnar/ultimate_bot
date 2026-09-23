@@ -6,6 +6,10 @@ core (SignalGenerator.decide) — the exact code the engine trades with — so t
 is zero drift between what is backtested and what trades real money.
 
 Trade management mirrors trade_logic.py:
+  - Exits: the engine's OWN decision function — `trade_policy.evaluate_exit`, the
+    same call the live manage cycle makes every service interval, so the
+    ordering (stop → TP → time stop → day-end → scale-out), the reason labels
+    and the level fills cannot drift from what trades
   - Bracket: fixed % of entry (SL_PERCENT / TP_PERCENT), TP floored at
     MIN_TP_PERCENT and widened to MIN_RISK_REWARD when needed
   - Trigger: daily-EMA50 regime gate + RSI dip (inside SignalGenerator.decide)
@@ -19,9 +23,12 @@ Trade management mirrors trade_logic.py:
   - Same-UTC-day close (CLOSE_AT_UTC_DAY_END) and a hard time stop (MAX_HOLD_TIME)
   - Daily drawdown circuit breaker (MAX_DAILY_DRAWDOWN) — same rule as live
 
-The active configuration has NO trailing stop and NO breakeven lock
-(BREAKEVEN_ENABLED=false; TRAILING_STOP_ACTIVATE=5% sits beyond the +3% TP), so
-the bracket + EOD + time stop are the complete exit model — matching the engine.
+Trailing and breakeven come from whatever config actually resolves, so a
+deployment that has armed the ATR trail (TRAILING_ATR_MULTIPLIER > 0) or the
+breakeven lock is replayed WITH them rather than against a preset that switches
+them off — the previous assumption (BREAKEVEN_ENABLED=false, a 5%
+TRAILING_STOP_ACTIVATE sitting beyond the +3% TP) describes the preset, not a
+resolved `.env`.
 
 Usage:
   ./venv/bin/python3 backtest.py                                  # .env defaults
@@ -31,6 +38,7 @@ Usage:
 Exit code 0 = backtest ran (regardless of profitability), 2 = could not run.
 """
 import argparse
+import bisect
 import json
 import os
 import sys
@@ -45,8 +53,8 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from config import load_config, PRESETS  # noqa: E402
 from src.strategies.signal_generator import SignalGenerator  # noqa: E402
 from src.strategies.trade_policy import (  # noqa: E402
-    bar_exit,
     effective_bracket,
+    evaluate_exit,
     ratchet_stops,
 )
 
@@ -178,15 +186,26 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
       * taker fee 0.05% per leg (VIP0 futures) instead of 0.1% spot
       * historical per-8h funding charged on the open position's notional
         (long pays positive rate) — fetched from /fapi/v1/fundingRate
-      * NOTIONAL.minNotional floor defaults to 100 USDT (futures reality)
+      * the funding ENTRY gate (`FUNDING_RATE_MAX`): a long whose most recently
+        settled rate exceeds the cap is skipped, exactly as the engine skips it
+      * NOTIONAL.minNotional floor read per symbol from fapi exchangeInfo
+        (5 USDT on most USDT perps; never the old "~100 USDT" folklore)
 
     `overrides` (dict) is applied AFTER the preset so sweeps can vary
     preset-pinned keys (e.g. MAX_TRADES_PER_DAY, RSI_TIMEFRAME_MS) — the same
     precedence the engine's .env would have had if the preset did not pin them.
     """
-    preset = PRESETS.get(preset_name) or PRESETS["intraday_rsi"]
+    preset_name = preset_name if preset_name in PRESETS else "intraday_rsi"
+    # ---- config resolution MUST match the engine ----
+    # `load_config()` is env-first: every strategy key is `os.getenv(key, preset[key])`,
+    # so the deployed `.env` overrides the preset and the preset only supplies defaults.
+    # Selecting the preset through `PRESET` and loading normally reproduces that exactly.
+    # (This previously did `cfg.update(preset)` on top of `load_config()`, which let the
+    # preset win and silently backtested a DIFFERENT strategy than the one trading —
+    # 8 keys differed on the deployed config. Keep `overrides` last: they are the
+    # research knobs and must beat both layers.)
+    os.environ["PRESET"] = preset_name
     cfg = load_config()
-    cfg.update({k: v for k, v in preset.items()})
     if overrides:
         cfg.update(overrides)
     if sl_percent is not None: cfg["SL_PERCENT"] = float(sl_percent)
@@ -248,6 +267,10 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
     risk_per_trade = float(cfg.get("RISK_PER_TRADE", 0.01))
     max_daily_dd = float(cfg.get("MAX_DAILY_DRAWDOWN", 0.05))
     close_eod = bool(cfg.get("CLOSE_AT_UTC_DAY_END", True))
+    try:
+        fr_max = float(cfg.get("FUNDING_RATE_MAX", 0) or 0)
+    except (TypeError, ValueError):
+        fr_max = 0.0
     # Notional allocation caps — mirrors RiskManager.calculate_position_size, which
     # takes min(risk-based size, allocation cap).
     alloc_cap_frac = min(float(cfg.get("BALANCE_USAGE_PERCENT", 1.0)),
@@ -273,8 +296,10 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
     day_start_equity = equity
     day_blocked = False
     last_exit_i = -10 ** 9
-    funding_events = []       # (ms, rate, notional, fee) — futures only, charged at settlement bars
+    funding_events = []       # (ms, rate) — futures only, charged at settlement bars
+    funding_lookup = []       # immutable copy for the ENTRY gate (funding_events is drained)
     funding_total = 0.0
+    funding_gate_skips = 0
 
     if is_futures:
         # Historical funding over the exact replay window (falls back to [] on
@@ -282,6 +307,12 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
         _f0 = times[0] if times else 0
         _f1 = times[-1] + tf_ms if times else 0
         funding_events = fetch_funding_rates(symbol, _f0, _f1)
+        # Sorted snapshot for the entry gate: the live gate reads the LAST SETTLED
+        # rate (premiumIndex.lastFundingRate), so the bar's decision moment looks up
+        # the most recent settlement at or before it. The charging loop drains the
+        # (separate) funding_events list, so this copy stays intact.
+        funding_lookup = sorted(funding_events)
+        funding_events = list(funding_lookup)
 
     def record(i, reason, fill_price, qty, entry_price, initial_stop, entry_fee):
         gross = (fill_price - entry_price) * qty
@@ -309,13 +340,13 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
             continue
 
         # ---- manage the open position on this bar ----
-        # Exits are decided by the SHARED policy (trade_policy.bar_exit), i.e. the
-        # exact function the live engine's numbers come from: stop (gap-aware,
-        # trailing-aware) → take-profit → +R scale-out → time stop. Ratchets are
-        # applied AFTER the exit check, so a stop raised by this bar's high can
-        # only trigger from the next bar — the pessimistic intrabar convention
-        # (the live engine polls ticks every SIGNAL_INTERVAL and never assumes the
-        # favourable path through a bar).
+        # Exits are decided by the SHARED policy (trade_policy.evaluate_exit) — the
+        # exact function the live engine's manage cycle calls, so the ordering,
+        # the labels and the fills cannot drift from what trades real money.
+        # Ratchets are applied AFTER the decision, so a stop raised by this bar's
+        # high can only trigger from the next bar — the pessimistic intrabar
+        # convention, and the same order the live engine uses (it ratchets after
+        # deciding too, so neither side assumes the favourable path through a bar).
         if position is not None:
             p = position
             bar = {"open": opens[i], "high": highs[i], "low": lows[i],
@@ -331,23 +362,25 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                         f_fee = f_rate * p["entry"] * p["qty"]
                         equity -= f_fee
                         funding_total += f_fee
-            plan = bar_exit(
-                bar, p["entry"], p["qty"], p["stop"], p["tp"], cfg,
+            # Day-end flatten: the live trigger is the wall clock inside the last
+            # five minutes of the UTC day, which a replay cannot know — its
+            # equivalent is the first bar of a new UTC day. The decision is priced
+            # at that bar's open (the day-end price), the same observable the live
+            # engine passes as its decision-moment reference.
+            bar_day = int(times[i]) // 86_400_000
+            entry_day = int(p.get("entry_ms") or times[p["entry_index"]]) // 86_400_000
+            plan = evaluate_exit(
+                p["entry"], p["qty"], p["stop"], p["tp"], cfg,
+                low=bar["low"], high=bar["high"], reference_price=bar["open"],
                 now_ms=times[i], entry_ms=p.get("entry_ms"),
                 trailing_stop=p.get("trailing_stop"), trailing_active=p.get("trailing_active", False),
                 initial_stop_price=p.get("initial_stop"),
                 scale_out_done=p.get("scale_out_done", False),
+                eod=bool(close_eod and bar_day != entry_day),
             )
             if plan.reason:
                 leg = record(i, plan.reason, plan.fill, p["qty"], p["entry"],
                              p.get("initial_stop") or p["stop"], p["entry_fee"])
-                equity += leg["pnl"]
-                trades.append(leg)
-                position = None
-                equity_curve.append(equity)
-                if position is None:
-                    last_exit_i = i
-                continue
                 equity += leg["pnl"]
                 trades.append(leg)
                 position = None
@@ -384,28 +417,18 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                 p["trailing_active"] = _ratchet["trailing_active"]
                 p["breakeven_activated"] = _ratchet["breakeven_activated"]
             else:
-                bar_day = int(times[i]) // 86_400_000
-                entry_day = int(p.get("entry_ms") or times[p["entry_index"]]) // 86_400_000
-                if close_eod and bar_day != entry_day:
-                    # Live closes in the last 5 minutes of the UTC day; a bar replay
-                    # fills at the next day's OPEN (the day-end price).
-                    leg = record(i, "TIME_STOP", bar["open"], p["qty"], p["entry"],
-                                 p.get("initial_stop") or p["stop"], p["entry_fee"])
-                    equity += leg["pnl"]
-                    trades.append(leg)
-                    position = None
-                    last_exit_i = i
-                else:
-                    # Profit-protection ladder on this bar's favourable extreme.
-                    _ratchet = ratchet_stops(p["entry"], bar["high"], p["stop"], cfg,
-                                             trailing_stop=p.get("trailing_stop"),
-                                             trailing_active=p.get("trailing_active", False),
-                                             breakeven_activated=p.get("breakeven_activated", False),
-                                             atr=p.get("atr"))
-                    p["stop"] = _ratchet["stop_price"]
-                    p["trailing_stop"] = _ratchet["trailing_stop"]
-                    p["trailing_active"] = _ratchet["trailing_active"]
-                    p["breakeven_activated"] = _ratchet["breakeven_activated"]
+                # Profit-protection ladder on this bar's favourable extreme — the
+                # same observable the live engine feeds (its wick high), applied at
+                # the same point in the cycle (after the decision).
+                _ratchet = ratchet_stops(p["entry"], bar["high"], p["stop"], cfg,
+                                         trailing_stop=p.get("trailing_stop"),
+                                         trailing_active=p.get("trailing_active", False),
+                                         breakeven_activated=p.get("breakeven_activated", False),
+                                         atr=p.get("atr"))
+                p["stop"] = _ratchet["stop_price"]
+                p["trailing_stop"] = _ratchet["trailing_stop"]
+                p["trailing_active"] = _ratchet["trailing_active"]
+                p["breakeven_activated"] = _ratchet["breakeven_activated"]
             equity_curve.append(equity)
             if position is None:
                 continue
@@ -440,6 +463,20 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
             equity_curve.append(equity)
             continue
 
+        # ---- funding-rate entry gate (futures only) ----
+        # Mirrors trade_logic.enter_trade: a long PAYS funding when the rate is
+        # positive, so pairs whose rate exceeds FUNDING_RATE_MAX are skipped and the
+        # capital stays available for pairs where funding is neutral. The live gate
+        # reads the last settled rate at decision time (the bar's close here).
+        # 0 disables it; missing history (network failure) never blocks a setup,
+        # matching the engine's "unreadable funding must not block a proven entry".
+        if is_futures and fr_max > 0 and funding_lookup:
+            _idx = bisect.bisect_right(funding_lookup, (times[i] + tf_ms, float("inf"))) - 1
+            if _idx >= 0 and funding_lookup[_idx][1] > fr_max:
+                funding_gate_skips += 1
+                equity_curve.append(equity)
+                continue
+
         entry = closes[i]
         # Bracket from the SHARED policy (fixed % by default, ATR-adaptive when
         # SL_ATR_MULTIPLIER > 0) — identical math to trade_logic.enter_trade.
@@ -472,11 +509,11 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
 
     return _summarize(symbol, preset_name, cfg, start_equity, equity, trades,
                       equity_curve, len(rows), quiet, funding_total=funding_total,
-                      market=market)
+                      market=market, funding_gate_skips=funding_gate_skips)
 
 
 def _summarize(symbol, preset_name, cfg, start_equity, equity, trades, curve, n_bars, quiet,
-               funding_total=0.0, market="spot"):
+               funding_total=0.0, market="spot", funding_gate_skips=0):
     # Position-level statistics: scale-out legs (PARTIAL_EXIT) are realized PnL and
     # count toward equity/fees, but a win/loss is decided by the FULL exit — a
     # partial +1R leg followed by a stopped-out runner is one losing trade, not a
@@ -502,6 +539,7 @@ def _summarize(symbol, preset_name, cfg, start_equity, equity, trades, curve, n_
         "symbol": symbol, "preset": preset_name, "bars": n_bars,
         "timeframe": cfg["TIMEFRAME"], "market": market,
         "funding_paid": round(funding_total, 4),
+        "funding_gate_skips": funding_gate_skips,
         "start_equity": start_equity, "end_equity": round(equity, 2),
         "return_pct": round(ret_pct, 2), "max_drawdown_pct": round(max_dd, 2),
         "trades": total, "wins": len(wins), "losses": len(losses),
@@ -514,10 +552,12 @@ def _summarize(symbol, preset_name, cfg, start_equity, equity, trades, curve, n_
     if not quiet:
         print(json.dumps(result, indent=2))
         print("\n  exit reasons:", {r: sum(1 for t in trades if t["reason"] == r) for r in
-                                    ("TAKE_PROFIT", "STOP_LOSS", "TIME_STOP", "PARTIAL_EXIT", "END_OF_DATA")})
+                                    ("TAKE_PROFIT", "STOP_LOSS", "TRAILING_STOP", "TIME_STOP",
+                                     "EOD_CLOSE", "PARTIAL_EXIT", "END_OF_DATA")})
     else:
         print(f"  {symbol} {preset_name}: ret={ret_pct:+.2f}% trades={total} wr={win_rate:.0f}% "
-              f"pf={pf:.2f} exp={expectancy:+.2f} fees={total_fees:.1f} dd={max_dd:.1f}%")
+              f"pf={pf:.2f} exp={expectancy:+.2f} fees={total_fees:.1f} dd={max_dd:.1f}%"
+              + (f" fund_gate_skips={funding_gate_skips}" if funding_gate_skips else ""))
     # Research aid: dump the raw trade list (entry/exit ms + reason + pnl) so it
     # can be diffed bar-by-bar against a research lab's own trade list.
     _dump = _env_str("BACKTEST_DUMP_TRADES")
@@ -563,6 +603,9 @@ def main():
     parser = argparse.ArgumentParser(description="Strategy backtest on real Binance klines (intraday_rsi)")
     parser.add_argument("--symbol", default=_env_str("BACKTEST_SYMBOL", "NEARUSDT"))
     parser.add_argument("--preset", default=_env_str("BACKTEST_PRESET", "intraday_rsi"), choices=list(PRESETS.keys()))
+    parser.add_argument("--market", default=_env_str("BACKTEST_MARKET", "spot"), choices=("spot", "futures"),
+                        help="spot (default) or futures — futures fetches fapi klines, switches fees to 0.05%%/leg, "
+                             "charges per-8h funding and applies the FUNDING_RATE_MAX entry gate")
     parser.add_argument("--pages", type=int, default=_env_num("BACKTEST_PAGES", int, 3), help="number of 1000-bar pages to fetch")
     parser.add_argument("--end", type=int, default=_env_num("BACKTEST_END_TIME", int), help="endTime ms (for reproducible runs)")
     parser.add_argument("--sl", type=float, default=_env_num("BACKTEST_SL_PERCENT", float), help="override SL_PERCENT (fixed %% stop)")
@@ -577,7 +620,8 @@ def main():
     parser.add_argument("--quiet", action="store_true", default=_env_bool("BACKTEST_QUIET"), help="one-line summary instead of full JSON")
     args = parser.parse_args()
 
-    print(f"Backtesting {args.symbol} | preset={args.preset} | pages={args.pages} (up to {args.pages * 1000} bars)")
+    print(f"Backtesting {args.symbol} | preset={args.preset} | market={args.market} | "
+          f"pages={args.pages} (up to {args.pages * 1000} bars)")
     t0 = time.time()
     result = run_backtest(args.symbol, args.preset, args.pages, end_time=args.end,
                           quiet=args.quiet,
@@ -585,7 +629,8 @@ def main():
                           cooldown_bars=args.cooldown_bars, max_hold=args.max_hold,
                           min_notional=args.min_notional, equity=args.equity,
                           balance_usage_percent=args.balance_usage_percent,
-                          max_symbol_allocation_percent=args.max_symbol_allocation_percent)
+                          max_symbol_allocation_percent=args.max_symbol_allocation_percent,
+                          market=args.market)
     if result is None:
         return 2
     print(f"\nCompleted in {time.time() - t0:.1f}s")

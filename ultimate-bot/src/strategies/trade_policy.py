@@ -1,8 +1,9 @@
 """Entry/exit trade policy — ONE source of truth for live trading and backtests.
 
-`trade_logic.manage_trade` (live) and `backtest.run_backtest` (proof) both call
-the pure helpers here, so a rule can never drift between what is backtested and
-what trades real money:
+`trade_logic.manage_trade` (live, every poll) and `backtest.run_backtest` (proof,
+every bar) both call `evaluate_exit` — the ONE exit decision — plus the pure
+level helpers below. Nothing else decides when a position closes, so a rule can
+never drift between what is backtested and what trades real money:
 
   * `effective_bracket(entry, config, atr)` — the bullish bracket. Fixed % by
     default (`SL_PERCENT`/`TP_PERCENT`, the proven model); an ATR-multiple stop
@@ -13,9 +14,10 @@ what trades real money:
   * `effective_stop(...)` — the stop a SELL would actually trigger at, i.e. the
     higher of the hard stop and the active trailing stop.
   * `scale_out_plan(...)` — the 1R partial-profit leg (how many units to bank).
-  * `bar_exit(...)` — evaluate one price bar against the bracket: stop → TP →
-    time stop, with the intrabar assumption made explicit so a backtest cannot
-    quietly assume the favourable path.
+  * `evaluate_exit(...)` — the single exit DECISION: stop → take-profit → time
+    stop → day-end flatten → +R scale-out, evaluated against normalised price
+    evidence with the intrabar assumption made explicit, so a backtest cannot
+    quietly assume the favourable path (and neither can the live engine).
 
 All helpers are pure (no I/O, no async) so they are trivially unit-testable and
 safe to call from the engine's hot path.
@@ -28,7 +30,8 @@ from dataclasses import dataclass
 @dataclass
 class ExitPlan:
     """Outcome of evaluating one bar against an open bullish position."""
-    reason: str | None = None            # STOP_LOSS | TAKE_PROFIT | TIME_STOP
+    reason: str | None = None            # STOP_LOSS | TRAILING_STOP | TAKE_PROFIT
+                                         # | TIME_STOP | EOD_CLOSE
     fill: float | None = None
     partial_units: float = 0.0           # scale-out: units to sell now
     partial_price: float | None = None
@@ -172,46 +175,84 @@ def ratchet_stops(entry_price, favorable_price, stop_price, config,
     return out
 
 
-def bar_exit(bar, entry_price, quantity, stop_price, take_profit, config,
-             now_ms=None, entry_ms=None, trailing_stop=None, trailing_active=False,
-             initial_stop_price=None, scale_out_done=False):
-    """Evaluate one price bar (open/high/low/close/ms) against the bracket.
+def evaluate_exit(entry_price, quantity, stop_price, take_profit, config,
+                  low=None, high=None, reference_price=None,
+                  now_ms=None, entry_ms=None, trailing_stop=None,
+                  trailing_active=False, initial_stop_price=None,
+                  scale_out_done=False, eod=False):
+    """The single exit DECISION for an open bullish position.
 
-    Evaluation order is deliberately pessimistic — the stop is checked before
-    the take-profit, and a gap through the stop fills at the bar's OPEN (what a
-    market order would actually get), not at the stop price.
+    `trade_logic.manage_trade` (live, once per poll) and `backtest.run_backtest`
+    (proof, once per bar) both call this, so the rule cannot drift between what
+    is backtested and what trades real money. Pure: no I/O, no async, no clock.
 
-    Returns an `ExitPlan`; `reason is None` means the position stays open.
-    Scale-out is returned as `partial_units` (the position remains open).
+    Evidence is normalised so each caller supplies what it can observe:
+
+      * `low` / `high` — most adverse and most favourable price seen since the
+        last evaluation. Live: the post-entry wick range over the last two
+        klines, folded together with the live tick. Backtest: the bar's low/high.
+      * `reference_price` — where a market order placed at this decision moment
+        fills. Live: the live tick. Backtest: the bar's open, because the bar is
+        evaluated at its own `now_ms`, making the open the price the decision is
+        actually priced at. A level that has already been traded through fills
+        here instead of at a level the market has left behind.
+      * `now_ms` / `entry_ms` — hold-time evidence, epoch milliseconds.
+      * `eod` — the caller's "we must be flat for the day end" signal. The trigger
+        is inherently venue-specific (live: the wall clock inside the last five
+        minutes of the UTC day; backtest: the first bar of a new UTC day), so it
+        is an input, not a clock read.
+
+    Priority — deliberately pessimistic, and identical on both sides:
+
+      1. protective stop — `TRAILING_STOP` once the trail is armed, else `STOP_LOSS`
+      2. take-profit
+      3. time stop (`MAX_HOLD_TIME`)
+      4. day-end flatten (`CLOSE_AT_UTC_DAY_END`)
+      5. +R scale-out — a partial: banks profit, the position stays open
+
+    The stop is checked before every profit-taking action, including the
+    scale-out: when one evidence window contains both a breach and a level above
+    it, the intrabar path is unknowable, so the position is assumed stopped. The
+    two scheduled exits are terminal, so they pre-empt a scale-out in the same
+    window rather than banking a partial into a position that is closing anyway.
+
+    Returns an `ExitPlan`; `reason is None and partial_units == 0` means hold.
     """
-    high = _fnum(bar.get("high"))
-    low = _fnum(bar.get("low"))
-    open_ = _fnum(bar.get("open"))
-    close = _fnum(bar.get("close"))
+    entry = _fnum(entry_price)
+    low = _fnum(low)
+    high = _fnum(high)
+    ref = _fnum(reference_price)
     stop = effective_stop(stop_price, trailing_stop, trailing_active)
     tp = _fnum(take_profit)
+    trail_armed = bool(trailing_active) and stop > _fnum(stop_price)
 
-    # 1) Protective stop (gap-aware).
+    # 1) Protective stop. The trail reports under its own reason so live and
+    #    backtest exit-reason histograms stay comparable instead of only
+    #    sharing a label by accident.
     if stop > 0 and low > 0 and low <= stop:
-        fill = open_ if (open_ > 0 and open_ < stop) else stop
-        return ExitPlan(reason="STOP_LOSS", fill=fill)
+        return ExitPlan(reason="TRAILING_STOP" if trail_armed else "STOP_LOSS",
+                        fill=ref if 0 < ref < stop else stop)
 
-    # 2) Take-profit (a gap ABOVE the target fills at the open — better price).
+    # 2) Take-profit (a reference already above the target is the better fill).
     if tp > 0 and high >= tp:
-        fill = open_ if (open_ > 0 and open_ > tp) else tp
-        return ExitPlan(reason="TAKE_PROFIT", fill=fill)
+        return ExitPlan(reason="TAKE_PROFIT", fill=ref if ref > tp else tp)
 
-    # 3) Scale-out leg at +R (bank a partial profit ONCE; position stays open).
-    units = 0.0 if scale_out_done else scale_out_plan(
-        entry_price, quantity, initial_stop_price, stop_price, config)
-    level = scale_out_price(entry_price, initial_stop_price, stop_price, config)
-    if units > 0 and level and high >= level and (tp <= 0 or level < tp):
-        return ExitPlan(partial_units=units,
-                        partial_price=max(level, open_) if open_ > 0 else level)
-
-    # 4) Time stop.
+    # 3) Time stop.
     max_hold = _fnum(config.get("MAX_HOLD_TIME"), 0.0)
     if max_hold > 0 and now_ms and entry_ms and (now_ms - entry_ms) / 1000.0 > max_hold:
-        return ExitPlan(reason="TIME_STOP", fill=close)
+        return ExitPlan(reason="TIME_STOP", fill=ref if ref > 0 else None)
+
+    # 4) Scheduled day-end flatten.
+    if eod:
+        return ExitPlan(reason="EOD_CLOSE", fill=ref if ref > 0 else None)
+
+    # 5) Scale-out leg at +R (bank a partial profit ONCE; position stays open).
+    #    Never at or above the take-profit — the full exit owns that level.
+    units = 0.0 if scale_out_done else scale_out_plan(
+        entry, quantity, initial_stop_price, stop_price, config)
+    level = scale_out_price(entry, initial_stop_price, stop_price, config)
+    if units > 0 and level and high >= level and (tp <= 0 or level < tp):
+        return ExitPlan(partial_units=units,
+                        partial_price=max(level, ref) if ref > 0 else level)
 
     return ExitPlan()

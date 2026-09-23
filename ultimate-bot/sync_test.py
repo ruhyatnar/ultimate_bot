@@ -15,9 +15,18 @@ Verifies the full data chain end to end:
      counts and total_realized_pnl reflect it (closed = W+L+B reconciles).
   E. Active-trade sync: inject an active_trades row -> /api/status data.trades
      shows it with entry/stop/TP.
-  F. Config sync: /api/status config exposes non-credential keys only.
-  G. Config live-refresh: the monitor re-reads .env when its mtime changes, so
+  B1. Loop heartbeat: the engine publishes a per-iteration heartbeat (so the
+     dashboard's loop light cannot freeze while the engine is healthy) and it
+     ACKNOWLEDGES the pause the monitor requested.
+  E2. Position mark sync: inject the engine's futures_state snapshot -> the served
+     trade row carries the ENGINE's mark / floating PnL / exchange size, and an
+     untracked exchange position is counted without double-counting PnL.
+  E3. Roadmap watchlist sync: the capital roadmap analyses the engine's LIVE
+     watched pairs (risk_state.monitored_symbols), not a list baked into
+     capital_roadmap.py, and a rotated watchlist invalidates its cache.
+  F. Config live-refresh: the monitor re-reads .env when its mtime changes, so
      an out-of-band edit is served without restarting the monitor.
+  G. Clean shutdown: SIGTERM after the sync writes exits 0 and releases the lock.
 
 Engine is left RUNNING during B–E so the monitor reads live state; SIGTERM at
 the end must still exit cleanly (exit 0, lock released).
@@ -204,6 +213,36 @@ def main():
             15,
         )
         check("pause reflected in /api/status control", ok)
+
+        # B1. The pause ACKNOWLEDGEMENT. The control file only records what the
+        # monitor ASKED for; the engine applies it at the top of its next loop
+        # iteration and reports that in its heartbeat, which is what lets the UI
+        # distinguish "paused" from "pause requested, not applied yet".
+        def loop_state():
+            return api(port_num, "/api/status").get("loop_state") or {}
+
+        ok = wait_for(lambda: isinstance(loop_state().get("cycle"), int), 45)
+        beat = loop_state()
+        check(
+            "engine publishes a decision-loop heartbeat",
+            ok and beat.get("cycle", 0) > 0,
+            f"cycle={beat.get('cycle')} phase={beat.get('phase')}",
+        )
+        check(
+            "heartbeat carries a fresh monitor-computed age",
+            isinstance(beat.get("age_s"), (int, float))
+            and beat["age_s"] < 60,
+            f"age_s={beat.get('age_s')}",
+        )
+        ok = wait_for(
+            lambda: loop_state().get("paused_applied") is True, 45
+        )
+        check(
+            "heartbeat ACKNOWLEDGES the pause (requested != applied)",
+            ok,
+            f"paused_applied={loop_state().get('paused_applied')} "
+            f"phase={loop_state().get('phase')}",
+        )
         _write_json(control_path, {"paused": False, "pause_reason": ""})
         ok = wait_for(
             lambda: (
@@ -213,6 +252,13 @@ def main():
             15,
         )
         check("resume reflected in /api/status control", ok)
+        ok = wait_for(lambda: loop_state().get("paused_applied") is False, 45)
+        check(
+            "heartbeat clears the acknowledgement after resume",
+            ok,
+            f"paused_applied={loop_state().get('paused_applied')} "
+            f"phase={loop_state().get('phase')}",
+        )
 
         print("=== B2. Realtime transport lights + balance provenance ===")
         ok = wait_for(
@@ -402,6 +448,238 @@ def main():
                 float(t["entry_price"]) == 100.0
                 and float(t["stop_price"]) == 98.0
                 and float(t["take_profit"]) == 104.0,
+            )
+
+        print("=== E2. Position mark / floating PnL sync with the engine ===")
+        # The dashboard's active-position row renders "Entry → Now", the change %,
+        # the Unrealized column and the bracket-ladder marker from `current_price`,
+        # which the engine has never written into active_trades. The monitor must
+        # therefore stamp the ENGINE's own published position state onto the row —
+        # here a live futures_state snapshot (uPnL 2.5 on 1.0 @ 100 -> mark 102.5)
+        # plus a second, UNTRACKED exchange position on another symbol.
+        db_write(
+            db_path,
+            "INSERT OR REPLACE INTO risk_state (key, value, updated_at)"
+            " VALUES ('futures_state', ?, ?)",
+            (
+                json.dumps(
+                    {
+                        "positions": [
+                            {
+                                "symbol": "TESTUSDT",
+                                "amount": 1.0,
+                                "entry_price": 100.0,
+                                "unrealized_pnl": 2.5,
+                            },
+                            {
+                                "symbol": "NAKEDUSDT",
+                                "amount": 2.0,
+                                "entry_price": 10.0,
+                                "unrealized_pnl": -0.3,
+                            },
+                        ],
+                        "leverage": 2,
+                        "margin_type": "CROSSED",
+                        "updated_ms": int(time.time() * 1000),
+                    }
+                ),
+                int(time.time() * 1000),
+            ),
+        )
+        ok = wait_for(
+            lambda: any(
+                t.get("current_price") is not None
+                for t in api(port_num, "/api/status")["data"].get("trades", [])
+                if t.get("symbol") == "TESTUSDT"
+            ),
+            10,
+        )
+        payload = api(port_num, "/api/status")
+        marked = [
+            t
+            for t in payload["data"].get("trades", [])
+            if t.get("symbol") == "TESTUSDT"
+        ]
+        check("engine mark reaches the served trade row", bool(ok and marked))
+        if marked:
+            t = marked[0]
+            check(
+                "mark derived from the engine's uPnL (100 + 2.5/1.0 = 102.5)",
+                abs(float(t.get("current_price", 0)) - 102.5) < 1e-9,
+                f"current_price={t.get('current_price')}",
+            )
+            check(
+                "engine floating PnL served verbatim",
+                abs(float(t.get("unrealized_pnl", 0)) - 2.5) < 1e-9,
+                f"unrealized_pnl={t.get('unrealized_pnl')}",
+            )
+            check(
+                "exchange-side size served",
+                float(t.get("live_qty", 0)) == 1.0,
+                f"live_qty={t.get('live_qty')}",
+            )
+            check(
+                "provenance names the engine snapshot",
+                t.get("position_source") == "engine-futures",
+                f"position_source={t.get('position_source')}",
+            )
+        check(
+            "tracked / untracked / live counts reconcile",
+            payload.get("positions_tracked") == 1
+            and payload.get("positions_untracked") == 1
+            and payload.get("positions_live") == 2,
+            f"{payload.get('positions_tracked')}/{payload.get('positions_untracked')}"
+            f"/{payload.get('positions_live')}",
+        )
+        check(
+            "open_positions counts the untracked exposure too",
+            payload.get("open_positions") == 2,
+            f"open_positions={payload.get('open_positions')}",
+        )
+        check(
+            "untracked_pnl counts ONLY the untracked position (no double count)",
+            abs(float(payload.get("untracked_pnl", 0)) - (-0.3)) < 1e-9,
+            f"untracked_pnl={payload.get('untracked_pnl')}",
+        )
+        # The snapshot injected above is WS-cache shaped: per-position leverage /
+        # margin_type are absent and there is no markPrice (only the positionRisk
+        # fallback carries those). The monitor must normalise them from the
+        # snapshot's own top level and from the published uPnL, or the Futures
+        # card renders `1× CROSSED` above a `—×` column for the same position.
+        served = (payload.get("futures") or {}).get("positions") or []
+        pos = next((p for p in served if p.get("symbol") == "TESTUSDT"), {})
+        check(
+            "per-position leverage/margin normalised from the snapshot",
+            pos.get("leverage") == 2 and pos.get("margin_type") == "CROSSED",
+            f"leverage={pos.get('leverage')} margin={pos.get('margin_type')}",
+        )
+        check(
+            "per-position mark derived from the engine's uPnL",
+            abs(float(pos.get("mark_price") or 0) - 102.5) < 1e-9,
+            f"mark_price={pos.get('mark_price')}",
+        )
+        # Clean up the synthetic snapshot so later sections see the real shape.
+        db_write(
+            db_path, "DELETE FROM risk_state WHERE key='futures_state'", ()
+        )
+
+        print(
+            "=== E3. Capital roadmap follows the engine's live watchlist ==="
+        )
+        # The roadmap's pair list used to be a literal inside capital_roadmap.py,
+        # so the card analysed a DIFFERENT universe from the one the engine trades
+        # (DYNAMIC_SYMBOLS rotates the watchlist with the screener). What it
+        # reports must be the pairs the engine actually has subscribed.
+        try:
+            import importlib
+
+            st = importlib.import_module("status")
+            import capital_roadmap as cr
+
+            # The real module fetches fapi over the network; stub it so this
+            # check is deterministic and offline.
+            saved = (cr.futures_floors, cr.futures_prices, cr.latest_funding)
+            # Floors picked to exercise BOTH outcomes whatever the deployed config:
+            # one far below any plausible proven notional, one far above it.
+            cr.futures_floors = lambda syms: {
+                s: (1e9 if s == "BIGUSDT" else 0.01) for s in syms
+            }
+            cr.futures_prices = lambda syms: {s: 1.0 for s in syms}
+            cr.latest_funding = lambda s: 0.0001
+            try:
+                # Read the payload from a PRIVATE COPY of the test DB: the serving
+                # monitor holds the original, and seeding total_equity there would
+                # make IT hit the exchange on every render. Copied via SQLite's
+                # backup API, not shutil — the engine runs WAL, so the schema can
+                # live entirely in the -wal sidecar and a bare file copy would
+                # arrive with no tables at all.
+                watch_db = os.path.join(tmp, "watchlist.db")
+                if os.path.exists(watch_db):
+                    os.remove(watch_db)
+                src_db = sqlite3.connect(db_path)
+                dst_db = sqlite3.connect(watch_db)
+                try:
+                    src_db.backup(dst_db)
+                finally:
+                    src_db.close()
+                    dst_db.close()
+                st._ROADMAP_CACHE.update(
+                    {"data": None, "ts": 0.0, "pairs": None}
+                )
+                db_write(
+                    watch_db,
+                    "INSERT OR REPLACE INTO risk_state (key, value, updated_at)"
+                    " VALUES ('total_equity', ?, ?)",
+                    ("25.0", int(time.time() * 1000)),
+                )
+                watch = ["AAAUSDT", "BIGUSDT"]
+                db_write(
+                    watch_db,
+                    "INSERT OR REPLACE INTO risk_state (key, value, updated_at)"
+                    " VALUES ('monitored_symbols', ?, ?)",
+                    (json.dumps(watch), int(time.time() * 1000)),
+                )
+                payload = st.build_status_payload({}, watch_db)
+                rm = payload.get("roadmap") or {}
+                pairs = [p.get("symbol") for p in rm.get("pairs", [])]
+                check(
+                    "roadmap analyses the engine's watched pairs",
+                    pairs == watch,
+                    f"pairs={pairs} watch={watch}",
+                )
+                check(
+                    "roadmap pair list == served monitored_symbols",
+                    pairs == payload.get("monitored_symbols"),
+                )
+                check(
+                    "roadmap reports which list it used",
+                    rm.get("pairs_source") == "engine-watchlist",
+                    f"pairs_source={rm.get('pairs_source')}",
+                )
+                # Derive the expectation from the served proven notional rather
+                # than hardcoding it, so the check holds under any RISK_PER_TRADE
+                # / SL_PERCENT and still catches a mis-partitioned list.
+                proven = float(rm.get("proven_notional") or 0.0)
+                exp_ok = [
+                    s
+                    for s, floor in (("AAAUSDT", 0.01), ("BIGUSDT", 1e9))
+                    if proven >= floor
+                ]
+                check(
+                    "floors decide ok/blocked over the watched set"
+                    f" (proven notional ${proven:.2f})",
+                    rm.get("ok_pairs") == exp_ok
+                    and rm.get("blocked_pairs") == [
+                        s for s in watch if s not in exp_ok
+                    ],
+                    f"ok={rm.get('ok_pairs')} blocked={rm.get('blocked_pairs')}",
+                )
+                # A rotated watchlist must invalidate the 10-minute cache, or the
+                # card keeps reporting floors for pairs the engine has dropped and
+                # omits the ones it just picked up.
+                rotated = ["AAAUSDT"]
+                db_write(
+                    watch_db,
+                    "INSERT OR REPLACE INTO risk_state (key, value, updated_at)"
+                    " VALUES ('monitored_symbols', ?, ?)",
+                    (json.dumps(rotated), int(time.time() * 1000)),
+                )
+                rm2 = (
+                    st.build_status_payload({}, watch_db).get("roadmap") or {}
+                )
+                got2 = [p.get("symbol") for p in rm2.get("pairs", [])]
+                check(
+                    "a rotated watchlist invalidates the roadmap cache",
+                    got2 == rotated,
+                    f"pairs={got2} expected={rotated}",
+                )
+            finally:
+                cr.futures_floors, cr.futures_prices, cr.latest_funding = saved
+        except Exception as e:
+            check(
+                "capital roadmap wiring available",
+                False,
+                f"{type(e).__name__}: {e}",
             )
 
         print(

@@ -213,6 +213,7 @@ const baseProps = {
   onToggleVpsPause: () => {},
   serverStats: null,
   wsStreams: null,
+  loopState: null,
   futuresState,
   untrackedPnl: null,
   roadmap,
@@ -247,6 +248,30 @@ test('renders all six dashboard sections', () => {
   assert.match(html, /Recent Completed Trades/);
 });
 
+test('capital roadmap states which universe it analyses', () => {
+  // The roadmap used to analyse a list baked into capital_roadmap.py, so the card
+  // described pairs the engine was not trading. It must present the engine's live
+  // watched set — and say that is what it is — falling back only when the engine
+  // has published no watchlist yet.
+  const watched = render({
+    roadmap: {
+      ...roadmap,
+      pairs_source: 'engine-watchlist',
+      pairs: [
+        { symbol: 'TAKEUSDT', price: 4.1, floor: 5, ok: true, funding_rate: 0.0001 },
+        { symbol: 'BCHUSDT', price: 300, floor: 20, ok: false, funding_rate: 0.0001 },
+      ],
+      ok_pairs: ['TAKEUSDT'],
+      blocked_pairs: ['BCHUSDT'],
+    },
+  });
+  assert.match(watched, /2 engine-watched pairs/);
+  assert.match(watched, /Capital Roadmap/);
+
+  const fallback = render({ roadmap: { ...roadmap, pairs_source: 'default' } });
+  assert.match(fallback, /0 fallback pairs/);
+});
+
 test('active position shows bracket ladder prices and market close', () => {
   const html = render({ activeTrades: [activeTrade] });
   assert.match(html, /SL 2\.9640/);
@@ -254,6 +279,69 @@ test('active position shows bracket ladder prices and market close', () => {
   assert.match(html, /Market Close/);
   assert.match(html, /Trailing/);
   assert.match(html, /of 3 slots/);
+});
+
+test('a stale engine position snapshot is flagged beside the mark', () => {
+  // The mark comes from the engine's own published snapshot; when that snapshot
+  // stops being refreshed the row must say so rather than presenting its last
+  // known state as a live price.
+  const stale = render({
+    activeTrades: [{ ...activeTrade, positionStale: true, positionAgeS: 412 }],
+  });
+  assert.match(stale, /engine stale/);
+  assert.match(stale, /412s old/);
+  const fresh = render({ activeTrades: [{ ...activeTrade, positionStale: false }] });
+  assert.doesNotMatch(fresh, /engine stale/);
+});
+
+test('the decision-loop row reads the engine heartbeat, not a frozen snapshot', () => {
+  // Per-symbol decisions only advance when a symbol gets past every gate, so
+  // pausing or holding a full book freezes that timestamp while the engine keeps
+  // looping. The row must report the engine's heartbeat (and say which source it used).
+  const withBeat = render({
+    loopState: {
+      cycle_ms: Date.now() - 3_000,
+      cycle: 42,
+      interval_s: 10,
+      phase: 'paused',
+      paused_requested: true,
+      paused_applied: true,
+      active_trades: 0,
+      symbols: 5,
+      age_s: 3,
+    },
+  });
+  assert.match(withBeat, /decision-loop heartbeat/);
+  assert.doesNotMatch(withBeat, /per-symbol signal snapshot/);
+  // No heartbeat (an older engine) -> fall back to the snapshot, and say so.
+  const noBeat = render({ loopState: null });
+  assert.match(noBeat, /per-symbol signal snapshot/);
+});
+
+test('a pause reads as applied only once the engine acknowledges it', () => {
+  const beat = (applied: boolean) => ({
+    cycle_ms: Date.now(),
+    cycle: 7,
+    interval_s: 10,
+    phase: applied ? 'paused' : 'trading',
+    paused_requested: applied,
+    paused_applied: applied,
+    active_trades: 0,
+    symbols: 5,
+    age_s: 1,
+  });
+  const pending = render({ controlPaused: true, loopState: beat(false) });
+  assert.match(pending, /pause requested/);
+  assert.doesNotMatch(pending, /entries paused/);
+
+  const applied = render({ controlPaused: true, loopState: beat(true) });
+  assert.match(applied, /entries paused/);
+  assert.doesNotMatch(applied, /pause requested/);
+
+  // Not paused -> no chip at all.
+  const running = render({ controlPaused: false, loopState: beat(false) });
+  assert.doesNotMatch(running, /pause requested/);
+  assert.doesNotMatch(running, /entries paused/);
 });
 
 test('breaker banner + card state when the engine trips the breaker', () => {

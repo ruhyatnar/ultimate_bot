@@ -111,6 +111,19 @@ export interface ActiveTrade {
   breakevenActivated: boolean;
   unrealizedPnl: number;
   unrealizedPnlPct: number;
+  /**
+   * Provenance of `currentPrice` / `unrealizedPnl`, stamped by the monitor from
+   * the engine's own published position state (see the engine README's
+   * "Active-position sync"). `db` means no engine mark was available and the row
+   * falls back to the entry price.
+   */
+  positionSource?: 'engine-futures' | 'engine-scan' | 'engine' | 'db';
+  /** Exchange-side position size — can differ from `quantity` before reconcile. */
+  liveQty?: number;
+  /** Age (seconds) of the engine snapshot behind these numbers; null if none. */
+  positionAgeS?: number | null;
+  /** The snapshot is older than the freshness budget: the engine stopped publishing. */
+  positionStale?: boolean;
 }
 
 export interface ClosedTrade {
@@ -282,6 +295,30 @@ export interface WsStreams {
   engine_age_s?: number | null;
 }
 
+/**
+ * Engine decision-loop heartbeat (risk_state["loop_state"]), written once per
+ * iteration on EVERY path — trading, paused, health-pause.
+ *
+ * The dashboard's loop light must read this rather than the age of the newest
+ * per-symbol signal snapshot: that snapshot only advances when a symbol gets past
+ * every gate, so pausing, holding a full book or a tripped breaker froze it while
+ * the engine was healthy. `paused_applied` is the engine acknowledging the pause
+ * the monitor asked for, so the UI can show an applied pause instead of echoing
+ * its own request.
+ */
+export interface LoopState {
+  cycle_ms: number;
+  cycle: number;
+  interval_s: number;
+  phase: 'trading' | 'paused' | 'health-pause' | string;
+  paused_requested: boolean;
+  paused_applied: boolean;
+  active_trades: number;
+  symbols: number;
+  /** Monitor-computed age (seconds) of the heartbeat. */
+  age_s?: number | null;
+}
+
 /** Engine-published USDⓈ-M futures account state (risk_state["futures_state"]). */
 export interface FuturesPosition {
   symbol: string;
@@ -326,6 +363,14 @@ export interface Roadmap {
   proven_notional: number;
   implied_leverage: number;
   futures_leverage_cfg: number;
+  /** Monitor-computed age (seconds) of this snapshot — floors/prices are cached 10 min. */
+  age_s?: number | null;
+  /**
+   * Which list `pairs` describes: the ENGINE's live watched symbols (rotated by
+   * the dynamic screener) or the fallback default list, used only when the
+   * engine has published no watchlist yet.
+   */
+  pairs_source?: 'engine-watchlist' | 'default';
   pairs: RoadmapPair[];
   ok_pairs: string[];
   blocked_pairs: string[];
