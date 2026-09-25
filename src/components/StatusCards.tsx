@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Radio, Layers, Rocket, FlaskConical, Play, Square, TrendingUp, TrendingDown, Clock } from 'lucide-react';
 import { WsStreams, FuturesState, Roadmap, FuturesSoak } from '../types';
+import { engineIsStale } from '../utils/freshness';
 
 export const FuturesPanel: React.FC<{ state: FuturesState | null; market: string; paper: boolean }> = ({ state, market, paper }) => {
   if (market !== 'futures') return null;
@@ -94,6 +95,13 @@ export const RoadmapCard: React.FC<{ roadmap: Roadmap | null }> = ({ roadmap }) 
   const roadmapUniverse = roadmap.pairs_source === 'default'
     ? `${roadmap.pairs.length} fallback pairs`
     : `${roadmap.pairs.length} engine-watched pairs`;
+  // Each blocked pair's own equity requirement, computed server-side from THAT
+  // pair's NOTIONAL floor (floor * SL% / RISK%) — not a figure baked into this
+  // file, which could only ever be right for one watchlist. Missing on older
+  // payloads: the chip then shows the symbol alone rather than a wrong number.
+  const requiredEquity = new Map(
+    roadmap.pairs.map(p => [p.symbol, p.required_equity]),
+  );
   return (
     <div className="bg-slate-800/80 border border-slate-700/60 rounded-xl p-5 shadow-sm">
       <div className="flex items-center justify-between mb-3">
@@ -147,9 +155,15 @@ export const RoadmapCard: React.FC<{ roadmap: Roadmap | null }> = ({ roadmap }) 
         {roadmap.ok_pairs.map(p => (
           <span key={p} className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 font-mono">{p}</span>
         ))}
-        {roadmap.blocked_pairs.map(p => (
-          <span key={p} className="text-[9px] px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-400 border border-slate-500/30 font-mono">{p} @ $24</span>
-        ))}
+        {roadmap.blocked_pairs.map(p => {
+          const required = requiredEquity.get(p);
+          const label = typeof required === 'number' && Number.isFinite(required)
+            ? `${p} @ $${required.toFixed(0)}`
+            : p;
+          return (
+            <span key={p} className="text-[9px] px-1.5 py-0.5 rounded bg-slate-500/10 text-slate-400 border border-slate-500/30 font-mono">{label}</span>
+          );
+        })}
       </div>
     </div>
   );
@@ -397,7 +411,9 @@ export const StreamLights: React.FC<{ streams: WsStreams | null; connected?: boo
   // Total ticker lag = the engine's own last-frame age PLUS how long ago the
   // engine published it (a stalled engine freezes its last numbers).
   const engineAge = typeof streams.engine_age_s === 'number' ? streams.engine_age_s : 0;
-  const engineStale = engineAge > 30;
+  // Shared budget (utils/freshness): the health card reads the same value, so a
+  // stream light can never call the engine live while the card calls it stale.
+  const engineStale = engineIsStale(engineAge);
   const baseFrame = streams.all_tickers?.last_frame_age_s;
   const frameAge = typeof baseFrame === 'number' ? baseFrame + engineAge : baseFrame;
   const frameLagging = typeof frameAge === 'number' && frameAge > 5;

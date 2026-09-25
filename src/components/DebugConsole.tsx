@@ -213,7 +213,9 @@ export const DebugConsole: React.FC<DebugConsoleProps> = ({
                       {log.symbol}:
                     </span>
                   )}
-                  <span className={`text-slate-200 break-all ${levelColor}`}>
+                  {/* whitespace-pre-wrap: multi-line records (a traceback
+                      attached to its ERROR line) must render as lines. */}
+                  <span className={`whitespace-pre-wrap text-slate-200 break-all ${levelColor}`}>
                     {log.message}
                   </span>
                 </div>

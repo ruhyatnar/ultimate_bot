@@ -168,11 +168,19 @@ async def probe(args) -> dict:
                                + ("live-mode client, signing enabled" if creds_ok else "paper-mode client (unsigned diagnostics)"))
 
     age = time.time() - getattr(client, "last_time_sync", 0)
-    off = getattr(client, "time_offset", 0)
-    ok = age <= 60 and abs(off) < 2500
+    # `None` = never measured (the clients' sentinel; 0 ms is a valid measurement
+    # and must not read as "unset"). A failed sync must be reported as such
+    # rather than crashing this very check with abs(None).
+    off = getattr(client, "time_offset", None)
+    measured = isinstance(off, (int, float))
+    ok = measured and age <= 60 and abs(off) < 2500
     check("clock_offset", ok)
-    line(ok, "Clock offset", f"{off:+.0f} ms vs exchange (synced {age:.1f}s ago)"
-         if ok else f"{off:+.0f} ms, {age:.0f}s old — investigate NTP before going live")
+    if not measured:
+        line(False, "Clock offset", f"no measurement ({age:.0f}s since the last sync attempt "
+                                     "failed) — investigate NTP before going live")
+    else:
+        line(ok, "Clock offset", f"{off:+.0f} ms vs exchange (synced {age:.1f}s ago)"
+             if ok else f"{off:+.0f} ms, {age:.0f}s old — investigate NTP before going live")
 
     # ── 4. THE signed read (credentials required) ─────────────────────────────
     if not creds_ok:

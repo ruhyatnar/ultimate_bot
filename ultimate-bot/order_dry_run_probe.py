@@ -123,8 +123,9 @@ def _synthetic_order(symbol, side, qty, price):
 def _prime_clock(client):
     """Fresh timestamps without a network hop (the dry run never transmits).
 
-    `_get_timestamp` re-syncs when the offset is unset/zero or the last sync is
-    stale; priming avoids that measure call while leaving the real signed path
+    `_get_timestamp` re-syncs when the offset is unset (`None` — a measured 0 ms
+    is a real offset and no longer triggers a re-sync) or the last sync is stale;
+    priming avoids that measure call while leaving the real signed path
     (timestamp -> query -> signature) fully intact.
     """
     offset = getattr(client, "time_offset", None)

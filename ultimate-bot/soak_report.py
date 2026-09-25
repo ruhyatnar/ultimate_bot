@@ -25,6 +25,10 @@ import time
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+import trade_stats  # noqa: E402  (one definition of "an exit", see module)
+
 DB_PATH = os.path.join(ROOT, "data", "trading.db")
 LOG_PATH = os.path.join(ROOT, "logs", "trading.log")
 
@@ -93,14 +97,16 @@ def main():
         print(f"  {DIM}none{RESET}")
 
     # ---- Orders / trade stats ----
-    row = cur.execute(
-        "SELECT COUNT(*) AS n, "
-        "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN 1 ELSE 0 END) AS closed, "
-        "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 THEN 1 ELSE 0 END) AS wins, "
-        "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0 THEN 1 ELSE 0 END) AS losses, "
-        "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN profit_loss ELSE 0 END) AS pnl "
-        "FROM orders").fetchone()
-    total_orders = int(row["n"] or 0)
+    # ONE definition of a closed trade, shared with the web monitor's stats, the
+    # soak card and the watchdog (trade_stats): the engine's own `exit_reason`
+    # when the DB has been migrated (else a non-zero realized PnL), with exit
+    # LEGS attributed to the trade they belong to. The `side='SELL'` form used
+    # here silently dropped every futures SHORT exit — a short is closed with a
+    # BUY — and counted a scale-out's two legs as two trades, so this report
+    # disagreed with the dashboard about the same run.
+    total_orders = int(cur.execute("SELECT COUNT(*) FROM orders").fetchone()[0] or 0)
+    exit_pred = trade_stats.exit_predicate(trade_stats.has_exit_reason(cur))
+    row = cur.execute(trade_stats.trades_totals_sql(exit_pred)).fetchone()
     closed, wins, losses = int(row["closed"] or 0), int(row["wins"] or 0), int(row["losses"] or 0)
     realized = float(row["pnl"] or 0)
     be = max(0, closed - wins - losses)
@@ -111,9 +117,7 @@ def main():
     print(f"  Closed trades       : {closed}  ({wins}W / {losses}L / {be}B)  win rate {wr:.1f}%")
     print(f"  Total realized PnL  : {GREEN if realized >= 0 else RED}${realized:+,.2f}{RESET} (net of fees)")
 
-    exits = cur.execute(
-        "SELECT symbol, side, status, profit_loss, created_at FROM orders "
-        "WHERE side='SELL' AND profit_loss IS NOT NULL ORDER BY created_at DESC LIMIT 10").fetchall()
+    exits = cur.execute(trade_stats.recent_exits_sql(exit_pred, 10)).fetchall()
     if exits:
         print(f"\n{BOLD} RECENT EXITS (last {len(exits)}){RESET}")
         for e in exits:

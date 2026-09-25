@@ -13,6 +13,10 @@ Verifies the full data chain end to end:
      /api/status aggregates top-level win_streak/loss_streak/cooldown_until.
   D. Stats sync: inject a closed SELL exit order with PnL -> winning/losing
      counts and total_realized_pnl reflect it (closed = W+L+B reconciles).
+  D2. Exit attribution served live: the engine's OWN reason reaches /api/status
+     verbatim (not re-derived from the PnL sign), a scale-out's legs count as one
+     trade, a short's BUY closing order is a closed trade, and rows the monitor
+     must still infer are flagged.
   E. Active-trade sync: inject an active_trades row -> /api/status data.trades
      shows it with entry/stop/TP.
   B1. Loop heartbeat: the engine publishes a per-iteration heartbeat (so the
@@ -23,9 +27,16 @@ Verifies the full data chain end to end:
      untracked exchange position is counted without double-counting PnL.
   E3. Roadmap watchlist sync: the capital roadmap analyses the engine's LIVE
      watched pairs (risk_state.monitored_symbols), not a list baked into
-     capital_roadmap.py, and a rotated watchlist invalidates its cache.
+     capital_roadmap.py, a rotated watchlist invalidates its cache, and a FAILED
+     refresh is backed off instead of being retried (with 15s network timeouts)
+     on every one of the /ws pusher's 1 Hz payload builds.
+  E4. Soak payload contract: /api/status always carries a `soak` section (null
+     hides the card) and a live soak exposes the fields the card reads.
   F. Config live-refresh: the monitor re-reads .env when its mtime changes, so
      an out-of-band edit is served without restarting the monitor.
+  H. Engine-log contract: /api/logs cannot be asked for the whole file (0 and
+     negative `lines=` used to return every byte), serves only complete records,
+     and the /ws incremental push delivers appended lines as whole records.
   G. Clean shutdown: SIGTERM after the sync writes exits 0 and releases the lock.
 
 Engine is left RUNNING during B–E so the monitor reads live state; SIGTERM at
@@ -298,6 +309,14 @@ def main():
                 wbal.get("source") == bal.get("source"),
                 f"http={bal.get('source')} ws={wbal.get('source')}",
             )
+        # The poke the dashboard relies on: the periodic pusher must actually
+        # reach a connected socket (not just answer the connect handshake).
+        pushes = ws_status_pushes(port_num, 4)
+        check(
+            "the monitor PUSHES status over /ws (not only the connect snapshot)",
+            pushes >= 2,
+            f"pusher frames in 4s={pushes}",
+        )
 
         print("=== C. Streak/cooldown aggregation sync ===")
         # NEW CONTRACT: streaks are ACCOUNT-LEVEL and displayed verbatim (the
@@ -405,6 +424,168 @@ def main():
             "winning PnL counted",
             wins == 1 and float(stats["total_realized_pnl"]) == 2.50,
             f"wins={wins} pnl={stats['total_realized_pnl']}",
+        )
+
+        print("=== D2. Exit attribution served by the live monitor ===")
+        # Two defects met here. The reason: the monitor DERIVED each exit's label
+        # from the PnL sign, so the engine's real reason (STOP_LOSS / TRAILING_STOP
+        # / TIME_STOP / EOD_CLOSE) never reached the dashboard — a profitable
+        # protective stop was coloured as a take-profit win. The identity: exits
+        # were found by `side='SELL'`, which misses any closing order that is not a
+        # spot-style SELL, and a scale-out's legs were counted as separate trades.
+        # The engine now persists its own reason (orders.exit_reason, added by the
+        # idempotent migration on boot) and the monitor must serve the corrected
+        # attribution.
+        def db_query(sql, params=()):
+            conn = sqlite3.connect(db_path, timeout=5)
+            try:
+                return conn.execute(sql, params).fetchall()
+            finally:
+                conn.close()
+
+        order_cols = {r[1] for r in db_query("PRAGMA table_info(orders)")}
+        check(
+            "engine migrated orders.exit_reason on boot",
+            "exit_reason" in order_cols,
+            f"cols={sorted(order_cols)}",
+        )
+
+        before = api(port_num, "/api/status")["data"]["stats"]
+        before_closed = int(before.get("closed_trades") or 0)
+        before_legs = int(before.get("exit_legs") or 0)
+        ex_ms = int(time.time() * 1000)
+        # (a) A scale-out on one symbol: a banked partial leg then the final exit,
+        #     net +20 -> ONE winning trade across TWO exit legs.
+        db_write(db_path,
+                 "INSERT INTO orders (order_id, symbol, side, order_type, price, quantity,"
+                 " executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price,"
+                 " exit_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 ("sync_test_scale_entry", "SCALEUSDT", "BUY", "MARKET", 10.0, 2.0, 2.0,
+                  "FILLED", ex_ms, ex_ms, 0.0, 10.0, None))
+        db_write(db_path,
+                 "INSERT INTO orders (order_id, symbol, side, order_type, price, quantity,"
+                 " executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price,"
+                 " exit_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 ("sync_test_scale_partial", "SCALEUSDT", "SELL", "MARKET", 0.0, 1.0, 1.0,
+                  "CANCELED", ex_ms + 10, ex_ms + 10, 30.0, 12.0, "TAKE_PROFIT"))
+        db_write(db_path,
+                 "INSERT INTO orders (order_id, symbol, side, order_type, price, quantity,"
+                 " executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price,"
+                 " exit_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 ("sync_test_scale_final", "SCALEUSDT", "SELL", "MARKET", 0.0, 1.0, 1.0,
+                  "FILLED", ex_ms + 20, ex_ms + 20, -10.0, 8.0, "TRAILING_STOP"))
+        # (b) A SHORT-style exit: the entry is a SELL and the closing order a BUY,
+        #     which a `side='SELL'` filter would never see.
+        db_write(db_path,
+                 "INSERT INTO orders (order_id, symbol, side, order_type, price, quantity,"
+                 " executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price,"
+                 " exit_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 ("sync_test_short_entry", "SHORTUSDT", "SELL", "MARKET", 5.0, 1.0, 1.0,
+                  "FILLED", ex_ms + 30, ex_ms + 30, 0.0, 5.0, None))
+        db_write(db_path,
+                 "INSERT INTO orders (order_id, symbol, side, order_type, price, quantity,"
+                 " executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price,"
+                 " exit_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 ("sync_test_short_exit", "SHORTUSDT", "BUY", "MARKET", 0.0, 1.0, 1.0,
+                  "FILLED", ex_ms + 40, ex_ms + 40, 5.0, 4.5, "TAKE_PROFIT"))
+
+        def _exit_attribution_ready():
+            try:
+                st = api(port_num, "/api/status")["data"]["stats"]
+                return int(st.get("closed_trades") or 0) >= before_closed + 2
+            except Exception:
+                return False
+
+        ok = wait_for(_exit_attribution_ready, 10)
+        payload = api(port_num, "/api/status")
+        stats = payload["data"]["stats"]
+        rows = {
+            o.get("order_id"): o
+            for o in payload["data"].get("orders", [])
+        }
+        check("the monitor observed the injected exits (stats moved)", ok,
+              f"closed={stats.get('closed_trades')} (before {before_closed})")
+        closed = int(stats.get("closed_trades") or 0)
+        legs = int(stats.get("exit_legs") or 0)
+        # Deltas, not absolutes: the engine under test is LIVE against real market
+        # data and may legitimately open and close its own paper trade during the
+        # run, so an exact count would assert something this test does not control.
+        check(
+            "both injected exits reach the served stats",
+            closed - before_closed >= 2 and legs - before_legs >= 3,
+            f"legs {before_legs}->{legs}, trades {before_closed}->{closed}",
+        )
+        # Every trade is formed from at least one leg, so new_legs > new_trades is
+        # exactly the statement "the scale-out's two legs were not counted as two
+        # trades" — and it survives any engine activity during the run.
+        check(
+            "a scale-out's legs are not counted as separate trades",
+            (legs - before_legs) > (closed - before_closed),
+            f"new legs={legs - before_legs} new trades={closed - before_closed}",
+        )
+        check(
+            "the engine's own reason is served verbatim (not inferred from the sign)",
+            (rows.get("sync_test_scale_final") or {}).get("exit_reason") == "TRAILING_STOP"
+            and (rows.get("sync_test_scale_final") or {}).get("exit_reason_inferred") is False,
+            f"got={(rows.get('sync_test_scale_final') or {}).get('exit_reason')}",
+        )
+        check(
+            "a profitable exit the engine called a TRAIL is not badged TAKE_PROFIT",
+            (rows.get("sync_test_scale_partial") or {}).get("exit_reason") == "TAKE_PROFIT"
+            and (rows.get("sync_test_scale_final") or {}).get("profit_loss") == -10.0,
+        )
+        check(
+            "a short's BUY exit is served as a closed trade",
+            (rows.get("sync_test_short_exit") or {}).get("exit_reason") == "TAKE_PROFIT"
+            and (rows.get("sync_test_short_exit") or {}).get("exit_reason_inferred") is False,
+            f"got={(rows.get('sync_test_short_exit') or {}).get('exit_reason')}",
+        )
+        check(
+            "a short exit's entry price comes from the opposite (SELL) leg",
+            float((rows.get("sync_test_short_exit") or {}).get("entry_price") or 0) == 5.0,
+            f"entry_price={(rows.get('sync_test_short_exit') or {}).get('entry_price')}",
+        )
+        check(
+            "an entry order is not served as an exit",
+            (rows.get("sync_test_short_entry") or {}).get("exit_reason") is None,
+            f"got={(rows.get('sync_test_short_entry') or {}).get('exit_reason')}",
+        )
+        check(
+            "a legacy exit with no stored reason is flagged as inferred",
+            (rows.get("sync_test_exit_1") or {}).get("exit_reason_inferred") is True,
+            f"got={(rows.get('sync_test_exit_1') or {}).get('exit_reason_inferred')}",
+        )
+        total = float(stats.get("total_realized_pnl") or 0.0)
+        wins = int(stats.get("winning_trades") or 0)
+        losses = int(stats.get("losing_trades") or 0)
+        be = int(stats.get("breakeven_trades") or 0)
+        check(
+            "stats reconcile closed == W+L+B after the scale-out",
+            closed == wins + losses + be,
+            f"{wins}W/{losses}L/{be}B closed={closed}",
+        )
+        check(
+            "streaks are served as numbers (int-coercible), not raw risk_state strings",
+            isinstance(stats.get("win_streak"), int)
+            and isinstance(stats.get("loss_streak"), int),
+            f"{type(stats.get('win_streak')).__name__}/{type(stats.get('loss_streak')).__name__}",
+        )
+        # Independent recomputation: the realized total is verified against the
+        # exit predicate written out here, in the test, rather than re-read from
+        # the serving code. If the monitor's predicate ever drifts (e.g. starts
+        # counting zero-PnL rows again) this diverges.
+        db_total = float(
+            db_query(
+                "SELECT COALESCE(SUM(profit_loss), 0) FROM orders WHERE"
+                " exit_reason IS NOT NULL"
+                " OR (profit_loss IS NOT NULL AND profit_loss != 0)"
+            )[0][0]
+            or 0.0
+        )
+        check(
+            "served realized total matches an independent exit-predicate sum",
+            abs(total - db_total) < 1e-6,
+            f"served={total} sql={db_total}",
         )
 
         print("=== E. Active-trade sync ===")
@@ -523,18 +704,35 @@ def main():
                 t.get("position_source") == "engine-futures",
                 f"position_source={t.get('position_source')}",
             )
+        # Derive the expectations from what is ACTUALLY being managed. The engine
+        # under test is live against real market data with its own signal loop, so
+        # it may legitimately open a paper trade mid-run. A hardcoded `1` silently
+        # asserted "the engine stayed flat for the whole run" — not this test's
+        # subject, and not something the engine guarantees — which made these two
+        # checks flaky (reproduced by injecting a second active_trades row). Assert
+        # the PARTITION instead: tracked = the symbols the served rows cover,
+        # untracked = published positions none of them covers, open = their union.
+        served_syms = {
+            str(t.get("symbol") or "").upper()
+            for t in payload["data"].get("trades", [])
+        }
+        injected_live = {"TESTUSDT", "NAKEDUSDT"}      # the snapshot injected above
+        exp_tracked = len(served_syms)
+        exp_untracked = len(injected_live - served_syms)
         check(
             "tracked / untracked / live counts reconcile",
-            payload.get("positions_tracked") == 1
-            and payload.get("positions_untracked") == 1
-            and payload.get("positions_live") == 2,
-            f"{payload.get('positions_tracked')}/{payload.get('positions_untracked')}"
-            f"/{payload.get('positions_live')}",
+            payload.get("positions_tracked") == exp_tracked
+            and payload.get("positions_untracked") == exp_untracked
+            and payload.get("positions_live") == len(injected_live),
+            f"tracked={payload.get('positions_tracked')} (rows {sorted(served_syms)})"
+            f" untracked={payload.get('positions_untracked')} (exp {exp_untracked})"
+            f" live={payload.get('positions_live')}",
         )
         check(
-            "open_positions counts the untracked exposure too",
-            payload.get("open_positions") == 2,
-            f"open_positions={payload.get('open_positions')}",
+            "open_positions is tracked ∪ live (untracked exposure counted once)",
+            payload.get("open_positions") == len(served_syms | injected_live),
+            f"open_positions={payload.get('open_positions')}"
+            f" (rows {sorted(served_syms)}, live {sorted(injected_live)})",
         )
         check(
             "untracked_pnl counts ONLY the untracked position (no double count)",
@@ -654,6 +852,46 @@ def main():
                     ],
                     f"ok={rm.get('ok_pairs')} blocked={rm.get('blocked_pairs')}",
                 )
+                # Every pair must publish the equity at which ITS OWN floor is
+                # cleared. The blocked chip used to render a literal '$24', which
+                # was only ever right for the watchlist of the day; serving the
+                # number per pair is what lets the card state the real one.
+                sl_pct = float(rm.get("sl_percent") or 0.0)
+                risk = float(rm.get("risk_per_trade") or 0.0)
+                rows = {p.get("symbol"): p for p in rm.get("pairs", [])}
+                mismatched = [
+                    s
+                    for s, r in rows.items()
+                    if not (
+                        risk > 0
+                        and sl_pct > 0
+                        and abs(
+                            float(r.get("required_equity") or 0.0)
+                            - float(r.get("floor") or 0.0) * sl_pct / risk
+                        ) < 0.01
+                    )
+                ]
+                check(
+                    "each pair publishes its own floor-clearing threshold"
+                    " (floor * SL% / RISK%)",
+                    not mismatched,
+                    f"mismatched={mismatched}",
+                )
+                blocked_rows = [
+                    r
+                    for r in rm.get("pairs", [])
+                    if r.get("symbol") in (rm.get("blocked_pairs") or [])
+                ]
+                check(
+                    "a blocked pair's threshold exceeds the proven notional"
+                    f" (${proven:.2f})",
+                    bool(blocked_rows)
+                    and all(
+                        float(r.get("required_equity") or 0.0) > proven
+                        for r in blocked_rows
+                    ),
+                    f"blocked={[(r.get('symbol'), r.get('required_equity')) for r in blocked_rows]}",
+                )
                 # A rotated watchlist must invalidate the 10-minute cache, or the
                 # card keeps reporting floors for pairs the engine has dropped and
                 # omits the ones it just picked up.
@@ -673,6 +911,74 @@ def main():
                     got2 == rotated,
                     f"pairs={got2} expected={rotated}",
                 )
+                # The soak section is always present (the dashboard's card decides
+                # on null whether to render), and a real soak exposes the fields
+                # the card reads. The card had no payload-contract test at all.
+                soak = payload.get("soak")
+                check(
+                    "payload carries a soak section (null hides the card)",
+                    "soak" in payload
+                    and (soak is None or isinstance(soak, dict)),
+                    f"soak={type(soak).__name__}",
+                )
+                if isinstance(soak, dict):
+                    check(
+                        "the soak section exposes the fields the card reads",
+                        {"running", "status", "closed", "pnl"} <= set(soak),
+                        f"keys={sorted(soak)}",
+                    )
+                # A roadmap refresh that FAILS must not be retried on every payload
+                # build: the floors/prices/funding reads are the only blocking
+                # network I/O in the payload path and the /ws pusher builds the
+                # payload once a SECOND, so an unreachable fapi used to put a
+                # 15s-timeout fetch in front of every push. The last good snapshot
+                # keeps being served and the retry is rate-limited.
+                good_pairs = [
+                    p.get("symbol") for p in (rm2.get("pairs") or [])
+                ]
+                calls = {"n": 0}
+
+                def _boom(*_a, **_kw):
+                    calls["n"] += 1
+                    raise OSError("fapi unreachable")
+
+                real_compute = cr.compute_roadmap
+                cr.compute_roadmap = _boom
+                try:
+                    # Stale beyond the success cache lifetime.
+                    st._ROADMAP_CACHE["ts"] = time.time() - st._ROADMAP_RETRY_S - 5
+                    st._ROADMAP_CACHE["fail_ts"] = 0.0
+                    failed_1 = st.build_status_payload({}, watch_db).get("roadmap")
+                    attempts = calls["n"]
+                    failed_2 = st.build_status_payload({}, watch_db).get("roadmap")
+                    check(
+                        "a failed roadmap refresh is attempted once, then backed off",
+                        attempts == 1 and calls["n"] == 1,
+                        f"attempts={calls['n']}",
+                    )
+                    check(
+                        "the last good roadmap survives a failed refresh",
+                        isinstance(failed_1, dict)
+                        and isinstance(failed_2, dict)
+                        and [p.get("symbol") for p in failed_2.get("pairs") or []]
+                        == good_pairs
+                        and failed_2.get("age_s") is not None,
+                        f"first={type(failed_1).__name__}"
+                        f" second={type(failed_2).__name__}",
+                    )
+                    # Once the backoff expires the retry resumes (no permanent
+                    # "never refresh again" state).
+                    st._ROADMAP_CACHE["fail_ts"] = (
+                        time.time() - st._ROADMAP_FAIL_BACKOFF_S - 1
+                    )
+                    st.build_status_payload({}, watch_db)
+                    check(
+                        "the roadmap retry resumes after the failure backoff",
+                        calls["n"] == 2,
+                        f"attempts={calls['n']}",
+                    )
+                finally:
+                    cr.compute_roadmap = real_compute
             finally:
                 cr.futures_floors, cr.futures_prices, cr.latest_funding = saved
         except Exception as e:
@@ -713,6 +1019,91 @@ def main():
             )
         except Exception as e:
             check("refresh_env_config available", False, e)
+
+        print("=== H. Engine-log endpoint + /ws log push ===")
+        # The Engine Log tab tails these two transports. `lines=0` (and any
+        # negative) used to reach readlines()[-0:] / [N:] — the WHOLE log, a
+        # 10 MB JSON response per poll on an unauthenticated URL — and a record
+        # caught mid-write was served truncated.
+        log_file = env["LOG_FILE"]
+        written = wait_for(
+            lambda: os.path.exists(log_file) and os.path.getsize(log_file) > 0, 60
+        )
+        check("engine writes the log the monitor tails", written)
+        if written:
+
+            def read_log():
+                with open(log_file, "rb") as f:
+                    return f.read().decode("utf-8", "replace")
+
+            def complete_records(text):
+                return [r for r in text.splitlines(True) if r.endswith("\n")]
+
+            pre = read_log()
+            total = len(complete_records(pre))
+            got5 = api(port_num, "/api/logs?lines=5").get("lines") or []
+            post = read_log()
+            check(
+                "tail returns the requested number of records",
+                0 < len(got5) <= 5 and total >= 5 and len(got5) == 5,
+                f"got={len(got5)} file={total}",
+            )
+            check(
+                "every served record is newline-terminated",
+                bool(got5) and all(r.endswith("\n") for r in got5),
+            )
+            check("the served tail is a suffix of the real log", "".join(got5) in post)
+            if pre == post:  # quiet file → the tail is exactly the newest records
+                check(
+                    "tail is exactly the newest records, in order",
+                    got5 == complete_records(post)[-5:],
+                    f"got={[r[:40] for r in got5]}",
+                )
+
+            zero = api(port_num, "/api/logs?lines=0").get("lines") or []
+            check("lines=0 yields ONE record, not the whole log", len(zero) == 1,
+                  f"got={len(zero)} of {total}")
+            neg = api(port_num, "/api/logs?lines=-2").get("lines") or []
+            check("a negative lines= yields ONE record, not the whole log", len(neg) == 1,
+                  f"got={len(neg)} of {total}")
+            huge = api(port_num, "/api/logs?lines=99999").get("lines") or []
+            check("an over-large lines= is capped", 0 < len(huge) <= 500, f"got={len(huge)}")
+            junk = api(port_num, "/api/logs?lines=abc").get("lines") or []
+            check(
+                "a non-numeric lines= falls back to the default, not to 1 record",
+                len(junk) > len(zero) and len(junk) <= 120,
+                f"got={len(junk)} zero={len(zero)} file={total}",
+            )
+
+            # A record caught mid-write must never be presented as a log line.
+            with open(log_file, "a") as f:
+                f.write("SYNC-LOG-UNTERMINATED")  # deliberately no newline
+            last1 = api(port_num, "/api/logs?lines=1").get("lines") or []
+            check(
+                "a half-written record is not served truncated",
+                bool(last1)
+                and all(r.endswith("\n") for r in last1)
+                and last1[-1] != "SYNC-LOG-UNTERMINATED",
+                f"got={[r[:50] for r in last1]}",
+            )
+
+            marker = f"SYNC-LOG-PUSH-{int(time.time())}\n"
+            with open(log_file, "a") as f:
+                f.write(marker)
+            pushed = ws_log_lines(port_num, 8)
+            # `in`, not equality: the unterminated probe above was still dangling,
+            # so the engine's next record (this marker) completes IT — which is
+            # exactly the carry behaviour being verified.
+            check(
+                "/ws pushes log lines appended after connect",
+                marker.strip() in "".join(pushed or []),
+                f"frames={len(pushed or [])} got={[r[:45] for r in (pushed or [])[:2]]}",
+            )
+            check(
+                "/ws log frames carry whole records",
+                bool(pushed) and all(r.endswith("\n") for r in pushed),
+                f"got={[r[:40] for r in (pushed or [])[:3]]}",
+            )
 
         print("=== G. Clean shutdown after sync writes ===")
         engine.send_signal(signal.SIGTERM)
@@ -771,6 +1162,82 @@ def ws_snapshot(port, timeout=15):
         return None
     except Exception:
         return None
+
+
+def ws_status_pushes(port, seconds=4):
+    """Count the status snapshots the PUSHER delivers within `seconds`.
+
+    The per-connection thread sends one snapshot on connect, so only frames
+    beyond that first one prove the periodic pusher reaches connected sockets.
+    It silently pushed nothing while /ws still looked alive: client sockets were
+    never registered, and the broadcast frame was built from a `str` (TypeError)
+    on every tick, swallowed by the pusher's blanket `except`.
+    """
+    try:
+        from websockets.sync.client import connect
+    except Exception:
+        return 0
+    count = 0
+    try:
+        with connect(
+            f"ws://127.0.0.1:{port}/ws", open_timeout=10, close_timeout=2
+        ) as ws:
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                try:
+                    raw = ws.recv(timeout=max(0.5, deadline - time.time()))
+                except Exception:
+                    break
+                try:
+                    frame = json.loads(
+                        raw if isinstance(raw, str) else raw.decode()
+                    )
+                except Exception:
+                    continue
+                if (
+                    isinstance(frame, dict)
+                    and frame.get("type") != "log"
+                    and frame.get("process")
+                ):
+                    count += 1
+    except Exception:
+        return 0
+    return max(0, count - 1)  # minus the connection thread's initial snapshot
+
+
+def ws_log_lines(port, timeout=8):
+    """Every log record the monitor's /ws channel pushes within `timeout`.
+
+    Unlike `ws_snapshot` this keeps the `{"type": "log"}` frames, so the
+    incremental tail (the Engine Log tab's primary transport) is verified end to
+    end rather than assumed.
+    """
+    try:
+        from websockets.sync.client import connect
+    except Exception:
+        return None
+    out = []
+    try:
+        with connect(
+            f"ws://127.0.0.1:{port}/ws", open_timeout=timeout, close_timeout=2
+        ) as ws:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    raw = ws.recv(timeout=max(0.5, deadline - time.time()))
+                except Exception:
+                    break
+                try:
+                    frame = json.loads(
+                        raw if isinstance(raw, str) else raw.decode()
+                    )
+                except Exception:
+                    continue
+                if isinstance(frame, dict) and frame.get("type") == "log":
+                    out.extend(frame.get("lines") or [])
+    except Exception:
+        return out
+    return out
 
 
 def _api_ok(port):

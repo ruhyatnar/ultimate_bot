@@ -32,7 +32,10 @@ class RestClient:
         self.symbol_info_cache = {}
         self._exchange_info_ts = 0.0
         self.timeout = aiohttp.ClientTimeout(total=15)
-        self.time_offset = 0
+        # None = never measured. 0 is a REAL offset (a local clock that happens
+        # to match Binance to the millisecond); using 0 as the "unmeasured"
+        # sentinel made every signed request re-sync first. See _get_timestamp.
+        self.time_offset = None
         self.last_time_sync = 0
         self._private_key = None
         self._initialized = False
@@ -111,9 +114,11 @@ class RestClient:
             self.logger.warning(f"Time sync failed: {e}")
 
     async def _get_timestamp(self):
-        if self.time_offset == 0 or (int(time.time()) - self.last_time_sync) > 300:
+        if self.time_offset is None or (int(time.time()) - self.last_time_sync) > 300:
             await self.sync_time()
-        return int(time.time() * 1000) + self.time_offset
+        # `or 0`: a failed sync leaves the offset unknown — fall back to the
+        # uncompensated local clock rather than crashing on None.
+        return int(time.time() * 1000) + (self.time_offset or 0)
 
     async def _request_internal(self, method, endpoint, params=None, signed=False):
         await self._ensure_session()

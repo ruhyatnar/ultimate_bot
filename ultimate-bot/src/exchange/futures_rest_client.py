@@ -71,7 +71,10 @@ class FuturesRestClient:
         self.symbol_info_cache = {}
         self._exchange_info_ts = 0.0
         self.timeout = aiohttp.ClientTimeout(total=15)
-        self.time_offset = 0
+        # None = never measured (see the spot client: a genuine 0 ms offset must
+        # not be mistaken for "unmeasured", or every signed order re-syncs first
+        # — and this endpoint's GET bypasses the rate limiter).
+        self.time_offset = None
         self.last_time_sync = 0
         self._private_key = None
         self._initialized = False
@@ -150,9 +153,9 @@ class FuturesRestClient:
             self.logger.warning(f"Time sync failed: {e}")
 
     async def _get_timestamp(self):
-        if self.time_offset == 0 or (int(time.time()) - self.last_time_sync) > 300:
+        if self.time_offset is None or (int(time.time()) - self.last_time_sync) > 300:
             await self.sync_time()
-        return int(time.time() * 1000) + self.time_offset
+        return int(time.time() * 1000) + (self.time_offset or 0)
 
     async def _request_internal(self, method, endpoint, params=None, signed=False):
         await self._ensure_session()

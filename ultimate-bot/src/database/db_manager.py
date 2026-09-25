@@ -93,7 +93,8 @@ class DatabaseManager:
                 price REAL, stop_price REAL, quantity REAL, executed_qty REAL,
                 status TEXT, created_at INTEGER, updated_at INTEGER,
                 profit_loss REAL DEFAULT 0,
-                avg_fill_price REAL
+                avg_fill_price REAL,
+                exit_reason TEXT
             );
             CREATE TABLE IF NOT EXISTS active_trades (
                 symbol TEXT PRIMARY KEY,
@@ -125,6 +126,16 @@ class DatabaseManager:
         rs_cols = {row[1] for row in await cur.fetchall()}
         if "updated_at" not in rs_cols:
             await self.conn.execute("ALTER TABLE risk_state ADD COLUMN updated_at INTEGER")
+        # Migration for databases created before the exit reason was persisted on
+        # the exit order. The engine has always KNOWN the reason (it is the return
+        # of trade_policy.evaluate_exit and is passed to close_trade) but only ever
+        # logged it, so the web monitor had to infer a label from the PnL sign —
+        # which files every profitable trailing-stop / time-stop / day-end exit as
+        # TAKE_PROFIT. Legacy rows keep NULL and are labelled as inferred.
+        cur = await self.conn.execute("PRAGMA table_info(orders)")
+        order_cols = {row[1] for row in await cur.fetchall()}
+        if "exit_reason" not in order_cols:
+            await self.conn.execute("ALTER TABLE orders ADD COLUMN exit_reason TEXT")
         await self.conn.commit()
 
     async def save_order(self, order_data):
@@ -140,7 +151,12 @@ class DatabaseManager:
             "executed_qty","status","created_at","updated_at","profit_loss","avg_fill_price"
         ]))
 
-    async def update_order_status(self, order_id, status, executed_qty=None, avg_fill_price=None, profit_loss=None):
+    async def update_order_status(self, order_id, status, executed_qty=None, avg_fill_price=None,
+                                  profit_loss=None, exit_reason=None):
+        # `exit_reason` is the engine's OWN decision reason (the `reason` from
+        # trade_policy.evaluate_exit) recorded on the exit order, so the monitor
+        # can render it instead of guessing from the PnL sign. Set on every exit
+        # leg, partial or final.
         fields, params = ["status = ?", "updated_at = ?"], [status, int(datetime.now().timestamp()*1000)]
         if executed_qty is not None:
             fields.append("executed_qty = ?"); params.append(executed_qty)
@@ -148,6 +164,8 @@ class DatabaseManager:
             fields.append("avg_fill_price = ?"); params.append(avg_fill_price)
         if profit_loss is not None:
             fields.append("profit_loss = ?"); params.append(profit_loss)
+        if exit_reason is not None:
+            fields.append("exit_reason = ?"); params.append(exit_reason)
         params.append(order_id)
         await self.execute(f"UPDATE orders SET {', '.join(fields)} WHERE order_id = ?", params)
 

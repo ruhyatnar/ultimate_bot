@@ -142,7 +142,8 @@ def compute_roadmap(equity, pairs=None, include_prices=True):
     Network reads (exchangeInfo floors, prices, funding) are cached by the
     caller when called often. Returns a JSON-safe dict:
       {equity, risk_per_trade, sl_percent, proven_notional, implied_leverage,
-       pairs: [{symbol, price, floor, ok, funding_rate}], ok_pairs, blocked_pairs,
+       pairs: [{symbol, price, floor, ok, required_equity, funding_rate}],
+       ok_pairs, blocked_pairs,
        stages: [{threshold, label, reached}], fee_edge_pct, pairs_source}
     """
     requested = [p.strip().upper() for p in (pairs or []) if p and p.strip()]
@@ -164,6 +165,10 @@ def compute_roadmap(equity, pairs=None, include_prices=True):
             "price": prices.get(s),
             "floor": floor,
             "ok": ok,
+            # Equity at which proven sizing clears THIS pair's floor:
+            # floor * SL% / RISK%. Per-pair, so the dashboard never has to
+            # assume a threshold that only holds for the current watchlist.
+            "required_equity": round(floor * sl_pct / risk, 2),
             "funding_rate": latest_funding(s),
         })
 
@@ -233,16 +238,20 @@ def main():
           f"(implied leverage {proven_notional/equity:.2f}x on equity)")
     print(f"pairs ({len(pairs)}) from {pairs_source}: {', '.join(pairs)}")
     print("=" * 78)
-    print(f"{'pair':10} {'price':>10} {'floor$':>7} {'ok?':>4} {'wallet%':>8} {'liq@lev':>9} {'funding/8h':>11}")
+    print(f"{'pair':10} {'price':>10} {'floor$':>7} {'req$':>6} {'ok?':>4} {'wallet%':>8} {'liq@lev':>9} {'funding/8h':>11}")
     ok_pairs, blocked_pairs = [], []
     for s in pairs:
         floor = floors.get(s)
         px = prices.get(s)
         if floor is None or px is None:
-            print(f"{s:10} {'?':>10} {'?':>7}  SKIP (no exchange data)")
+            print(f"{s:10} {'?':>10} {'?':>7} {'?':>6}  SKIP (no exchange data)")
             continue
         ok = proven_notional >= floor
         (ok_pairs if ok else blocked_pairs).append(s)
+        # Equity at which THIS pair's floor is cleared. Shown per row because a
+        # watchlist can span several floors — quoting one figure for all of them
+        # over-states what the cheaper pairs need.
+        required = floor * sl_pct / risk
         # Wallet fit at exchange leverage 1: notional cannot exceed the wallet.
         wallet_pct = proven_notional / equity * 100
         # Liquidation distance at the CONFIGURED leverage (maintenance-margin
@@ -251,10 +260,12 @@ def main():
         # unless someone raises FUTURES_LEVERAGE.
         liq_pct = (1.0 / max(lev_cfg, 1)) * 100
         fr = latest_funding(s)
-        print(f"{s:10} {px:>10.4f} {floor:>7.0f} {'YES' if ok else 'NO':>4} "
+        print(f"{s:10} {px:>10.4f} {floor:>7.0f} {required:>6.0f} {'YES' if ok else 'NO':>4} "
               f"{wallet_pct:>7.0f}% {liq_pct:>8.0f}% {fr*100:>10.4f}%")
     print()
-    print(f"(wallet% = margin used at FUTURES_LEVERAGE=1; liq@lev = liquidation "
+    print("(req$ = equity at which THIS pair's floor is cleared, i.e. "
+          f"floor * SL% / RISK% = floor * {sl_pct:.4f} / {risk:.3f}; "
+          "wallet% = margin used at FUTURES_LEVERAGE=1; liq@lev = liquidation "
           f"distance at the configured {lev_cfg}x — both far beyond the "
           f"{sl_pct*100:.1f}% stop)")
     print()
@@ -283,9 +294,18 @@ def main():
         print(f"    (proven ${proven_notional:.2f} notional clears their floors, "
               f"implied {proven_notional/equity:.2f}x leverage — no extra leverage needed)")
     if blocked_pairs:
-        th = max_floor * sl_pct / risk
-        print(f"  * Stay spot on: {', '.join(blocked_pairs)} until ~${th:.0f} equity "
-              f"(or drop them from the futures watchlist).")
+        # One threshold PER pair. This used to quote `max_floor * SL% / RISK%` for
+        # the whole blocked set, which over-states what a lower-floor pair needs —
+        # a $5-floor pair is blocked at $22 equity but tradable at $6, not $24.
+        print("  * Stay spot on these until proven sizing clears THEIR floor:")
+        for s in sorted(blocked_pairs, key=lambda x: floors.get(x) or 0.0):
+            floor = floors.get(s)
+            if floor is None:
+                continue
+            required = floor * sl_pct / risk
+            print(f"      {s:12} floor ${floor:>6.0f}  ->  tradable at "
+                  f"~${required:.0f} equity (+{required - equity:.0f})")
+        print("    (or drop them from the futures watchlist.)")
     print(f"  * Futures fee edge: {fee_edge:.2f}% per round trip (taker), identical signals.")
     print("  * Keep PAPER first: MARKET=futures PAPER_TRADE=true on an isolated DB,")
     print("    then flip MARKET in .env only after a 24h futures soak mirrors this math.")

@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 
+import trade_stats  # one definition of "an exit"/"a trade" for every reader
+
 load_dotenv()
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -136,29 +138,61 @@ def pm2_soak_status():
 
 
 def soak_metrics():
-    """Paper equity / trade tally from the isolated soak DB."""
+    """Paper equity / trade tally from the isolated soak DB.
+
+    The tally uses trade_stats' definition of a closed trade. This function used
+    to ask for `status='CLOSED'` — a status the engine has never written (it
+    writes FILLED/PARTIALLY_FILLED/CANCELED/EXPIRED/REJECTED) — so EVERY summary
+    the watchdog sends (the deadline 'SOAK COMPLETE' report and both alert
+    summaries) reported 0 closed trades, 0 wins and $0.00 PnL for a soak that had
+    traded. `side='SELL'` would be just as wrong here: this is a FUTURES soak, and
+    a short is closed with a BUY.
+    """
     m = {}
     try:
         conn = sqlite3.connect(f"file:{SOAK_DB}?mode=ro", uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
         rs = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM risk_state")}
         m["balance"] = float(rs.get("paper_balance", 0) or 0)
-        m["start_balance"] = float(rs.get("paper_start_balance", 0) or 0)
-        m["max_dd_pct"] = float(rs.get("max_drawdown_pct", 0) or 0)
-        m["win_streak"] = int(float(rs.get("win_streak", 0) or 0))
-        m["lose_streak"] = int(float(rs.get("lose_streak", 0) or 0))
+        # Streaks: the engine persists `loss_streak`/`win_streak`. The old key read
+        # here ('lose_streak') does not exist, so the L figure was always 0, and
+        # `engine_risk` is what the monitor is meant to DISPLAY — it keeps the
+        # streak that TRIPPED an active cooldown instead of the reset counter.
         try:
-            row = conn.execute(
-                "SELECT COUNT(*) n, COALESCE(SUM(profit_loss),0) pnl FROM orders WHERE status='CLOSED'"
-            ).fetchone()
-            m["closed"] = row["n"]
-            m["pnl"] = row["pnl"]
-            m["wins"] = conn.execute(
-                "SELECT COUNT(*) FROM orders WHERE status='CLOSED' AND profit_loss>0"
-            ).fetchone()[0]
-        except sqlite3.Error:
-            m["closed"] = m["wins"] = 0
+            eng = json.loads(rs.get("engine_risk") or "{}") or {}
+        except (ValueError, TypeError):
+            eng = {}
+        if not isinstance(eng, dict):
+            eng = {}
+        m["win_streak"] = int(
+            float(eng.get("win_streak", rs.get("win_streak", 0)) or 0)
+        )
+        m["loss_streak"] = int(
+            float(eng.get("loss_streak", rs.get("loss_streak", 0)) or 0)
+        )
+        # Drawdown actually used, as a percentage: the engine publishes it in
+        # engine_risk (`max_drawdown_pct` was never a risk_state key).
+        m["max_dd_pct"] = round(
+            max(0.0, float(eng.get("drawdown_used") or 0)) * 100, 2
+        )
+        try:
+            exit_pred = trade_stats.exit_predicate(
+                trade_stats.has_exit_reason(conn)
+            )
+            row = conn.execute(trade_stats.trades_totals_sql(exit_pred)).fetchone()
+            m["closed"] = int(row["closed"] or 0)
+            m["wins"] = int(row["wins"] or 0)
+            m["losses"] = int(row["losses"] or 0)
+            m["pnl"] = float(row["pnl"] or 0)
+        except Exception:
+            m["closed"] = m["wins"] = m["losses"] = 0
             m["pnl"] = 0.0
+        # `paper_start_balance` is not a key the engine writes either, so
+        # "(start $0.00)" and the %-PnL beside it were fiction. Derive the run's
+        # starting equity from the paper balance net of realized PnL.
+        m["start_balance"] = float(rs.get("paper_start_balance") or 0) or (
+            m["balance"] - m["pnl"]
+        )
         m["open"] = conn.execute("SELECT COUNT(*) FROM active_trades").fetchone()[0]
         conn.close()
     except Exception as e:
@@ -203,8 +237,11 @@ def fmt_summary(m, hours, prefix):
         f"uptime: **{hours:.1f}h** | paper equity: **${m.get('balance', 0):.2f}** "
         f"(start ${m.get('start_balance', 0):.2f})\n"
         f"PnL: **${m.get('pnl', 0):+.4f} ({pnl_pct:+.2f}%)** | closed: **{m.get('closed', 0)}** "
-        f"(W {m.get('wins', 0)} / L {m.get('closed', 0) - m.get('wins', 0)}, winrate {wr:.0f}%)\n"
-        f"max DD: {m.get('max_dd_pct', 0):.2f}% | streaks W{m.get('win_streak', 0)}/L{m.get('lose_streak', 0)} "
+        f"(W {m.get('wins', 0)} / L {m.get('losses', 0)}, "
+        f"B {max(0, m.get('closed', 0) - m.get('wins', 0) - m.get('losses', 0))}, "
+        f"winrate {wr:.0f}%)\n"
+        f"daily DD used: {m.get('max_dd_pct', 0):.2f}% | streaks "
+        f"W{m.get('win_streak', 0)}/L{m.get('loss_streak', 0)} "
         f"| open: {m.get('open', 0)}"
     )
 

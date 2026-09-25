@@ -42,6 +42,15 @@ from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+# Monitor-side DB readers share ONE definition of "an exit" (and of "a trade"):
+# the same `side='SELL'` filter had been copied into the soak card, the soak
+# watchdog, the post-soak report and the smoke test before it was fixed in the
+# dashboard's stats, and every copy silently dropped a futures SHORT's exit.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import trade_stats  # noqa: E402  (see trade_stats module docstring)
+
 # Process environment captured at import time, BEFORE any project module can
 # call dotenv. `config.py` runs load_dotenv() (reached lazily through
 # capital_roadmap), which injects every .env key into os.environ; if load_env()
@@ -69,8 +78,18 @@ CLEAR = "\033[2J\033[H"
 
 # In-memory TTL caches to prevent excessive I/O and respect exchange rate limits
 _balance_cache = {"ts": 0, "data": None}
-_scanned_cache = {"ts": 0, "data": None}
+# `fail_ts` rate-limits RETRIES after a FAILED screener fetch, for the same
+# reason _ROADMAP_CACHE has one: this is blocking network I/O in a path the /ws
+# pusher runs once a second. The success TTL alone could not bound it — it was
+# gated on `_scanned_cache["data"]` being truthy, so after a failure `ts` stayed
+# 0 and the gate was never entered: one 4s-timeout request went in front of
+# EVERY payload build while the endpoint was unreachable (or while it answered
+# with no qualifying symbol), and the realtime status/log stream backed up
+# behind a dead screener instead of degrading to the last good list.
+_scanned_cache = {"ts": 0, "data": None, "fail_ts": 0.0}
 _tickers_cache = {"ts": 0, "data": {}}
+_SCANNED_TTL_S = 15.0  # serve a successful fetch for this long
+_SCANNED_FAIL_BACKOFF_S = 60.0  # wait this long after a failed fetch
 
 # ---------------------------------------------------------------------------
 # WebSocket hub — realtime push of status snapshots + log tails to browsers.
@@ -169,7 +188,15 @@ _ENV_MTIME = {"path": None, "mtime": None}
 # Cached capital-roadmap payload (live exchange data). Reused for 10 min, and
 # recomputed early whenever the engine's watched-pair set changes — the floors
 # belong to those specific symbols, so a rotated watchlist invalidates them.
-_ROADMAP_CACHE = {"data": None, "ts": 0.0, "pairs": None}
+# `fail_ts` rate-limits RETRIES after a failed refresh: the roadmap is the only
+# blocking network I/O in the payload path and the payload is built once a
+# second by the /ws pusher, so "data is missing/stale" staying true while fapi
+# is unreachable used to mean a 15s-timeout fetch (exchangeInfo + prices + a
+# funding call per pair) on EVERY tick — the realtime status/log stream backed
+# up behind a dead exchange instead of degrading to the last good snapshot.
+_ROADMAP_CACHE = {"data": None, "ts": 0.0, "pairs": None, "fail_ts": 0.0}
+_ROADMAP_RETRY_S = 600.0  # success cache lifetime
+_ROADMAP_FAIL_BACKOFF_S = 120.0  # wait after a failed refresh before retrying
 
 # Futures soak PM2 process / DB conventions (see futures_soak.sh + soak_watchdog.py).
 _SOAK_DB = os.path.join(
@@ -204,6 +231,19 @@ def _futures_soak_snapshot(env_config):
              closed, wins, losses, pnl, last_trade_ms} — all best-effort.
     """
     snap = {"running": False, "status": "not running", "db": _SOAK_DB}
+    # The soak's length is resolved from the LIVE config, not from the import-time
+    # process environment: `soak_watchdog.py` reads .env (load_dotenv) and the
+    # operator's knob lives there, so a `.env` SOAK_HOURS would have left the
+    # card's deadline and progress bar at 24h while the supervisor enforced a
+    # different deadline — the exact drift the config-refresh path exists to stop.
+    hours_total = _safe_float(
+        (env_config or {}).get("SOAK_HOURS")
+        if isinstance(env_config, dict)
+        else None,
+        0.0,
+    )
+    if not (hours_total > 0):
+        hours_total = _SOAK_HOURS
     try:
         out = subprocess.run(
             ["pm2", "jlist"],
@@ -252,8 +292,10 @@ def _futures_soak_snapshot(env_config):
                 snap["uptime_h"] = round(
                     max(0.0, time.time() * 1000 - start_ms) / 3_600_000, 2
                 )
-                snap["deadline_ms"] = int(start_ms + _SOAK_HOURS * 3_600_000)
-                snap["hours_total"] = _SOAK_HOURS
+                snap["deadline_ms"] = int(
+                    start_ms + hours_total * 3_600_000
+                )
+                snap["hours_total"] = hours_total
 
         # Watchdog supervision (PM2 app: soak-watchdog) — the dashboard light
         # must distinguish 'supervised & quiet' from 'nobody is watching'.
@@ -332,19 +374,32 @@ def _futures_soak_snapshot(env_config):
                 ).fetchone()
                 if row:
                     snap["paper_balance"] = _safe_float(row["value"], None)
+                # The SAME definition of a closed trade the dashboard's stats use
+                # (trade_stats): the engine's own exit_reason when this soak DB
+                # has been migrated, else the legacy non-zero-PnL test, and exit
+                # LEGS attributed to the trade they belong to. The query this
+                # replaced filtered `side='SELL'` in a FUTURES soak, so every
+                # short — the thing a futures soak is run to observe — was
+                # missing from the card's closed/wins/losses/PnL, and a scale-out
+                # was counted as two trades.
+                exit_pred = trade_stats.exit_predicate(
+                    trade_stats.has_exit_reason(conn)
+                )
                 stats = conn.execute(
-                    "SELECT COUNT(*) AS closed, "
-                    "SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END) AS wins, "
-                    "SUM(CASE WHEN profit_loss < 0 THEN 1 ELSE 0 END) AS losses, "
-                    "SUM(profit_loss) AS pnl, MAX(updated_at) AS last_trade_ms "
-                    "FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') "
-                    "AND profit_loss IS NOT NULL"
+                    trade_stats.trades_totals_sql(exit_pred)
                 ).fetchone()
                 snap["closed"] = int(stats["closed"] or 0)
                 snap["wins"] = int(stats["wins"] or 0)
                 snap["losses"] = int(stats["losses"] or 0)
                 snap["pnl"] = round(float(stats["pnl"] or 0.0), 4)
-                snap["last_trade_ms"] = int(stats["last_trade_ms"] or 0) or None
+                # "Last trade" is the newest EXIT's own timestamp. It used to be
+                # MAX(updated_at) over EVERY row, which any later order write
+                # (an entry fill, a cancel) moves — so the card could date the
+                # last trade after the last exit and disagree with `closed`.
+                last = conn.execute(
+                    f"SELECT MAX(created_at) FROM orders WHERE {exit_pred}"
+                ).fetchone()
+                snap["last_trade_ms"] = int((last and last[0]) or 0) or None
             finally:
                 conn.close()
     except Exception:
@@ -681,12 +736,101 @@ def apply_env_updates(env_path, updates):
     return applied
 
 
-def tail_log_file(log_path, lines=120):
+# /api/logs tail bounds. The endpoint is unauthenticated, so the size is a
+# server-side contract, never the caller's: `lines=0` (or negative) used to reach
+# readlines()[-0:] / readlines()[N:], i.e. the ENTIRE log — a 10 MB JSON response
+# per request on a URL the browser polls every 5s.
+DEFAULT_LOG_LINES = 120
+MAX_LOG_LINES = 500
+
+
+def clamp_log_lines(raw, default=DEFAULT_LOG_LINES, maximum=MAX_LOG_LINES):
+    """Bound an /api/logs `lines=` value to [1, maximum]; junk → the default."""
     try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            return f.readlines()[-lines:]
-    except Exception:
-        return []
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, maximum))
+
+
+def _tail_log_window(log_path, lines):
+    """Backward byte scan → (records, start_offset, end_offset).
+
+    `records` are the last `lines` COMPLETE records; both offsets are RECORD
+    BOUNDARIES, so a reader can resume at the start (re-serve the tail) or at the
+    end (continue incrementally) without splitting a line. Reads backwards in
+    blocks so a poll never slurps a whole 10 MB log, and keeps only
+    newline-terminated records: the engine writes through a buffered handler, so
+    the tail can end mid-record and a truncated fragment must not be presented
+    as a log line.
+    """
+    lines = clamp_log_lines(lines)
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            pos = end
+            buf = b""
+            while pos > 0:
+                step = min(8192, pos)
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+                # lines + 1 newlines guarantee `lines` records even after the
+                # first (mid-record) span is dropped below.
+                if buf.count(b"\n") > lines:
+                    break
+    except OSError:
+        return [], 0
+    spans = []
+    start_b = 0
+    for i in range(len(buf)):
+        if buf[i] == 0x0A:
+            spans.append((start_b, i + 1))
+            start_b = i + 1
+    if pos > 0:
+        spans = spans[1:]  # first span began mid-record
+    spans = spans[-lines:]
+    if not spans:
+        return [], end, end
+    records = [buf[s:e].decode("utf-8", "replace") for s, e in spans]
+    return records, pos + spans[0][0], pos + spans[-1][1]
+
+
+def tail_log_file(log_path, lines=DEFAULT_LOG_LINES):
+    """The last `lines` COMPLETE log records (see `_tail_log_window`)."""
+    return _tail_log_window(log_path, lines)[0]
+
+
+def _read_new_log_lines(log_path, offset):
+    """Read log bytes appended since `offset`; return (records, new_offset).
+
+    Only NEWLINE-TERMINATED records are returned. Reading while the engine is
+    mid-write yields a partial record: emitting that fragment and advancing the
+    offset past it truncates the line on the dashboard AND loses its remainder
+    forever, so the fragment is carried (new_offset stops before it) and sent
+    once its newline lands. Bytes are read raw so a partial record can hold a
+    split multi-byte character without being corrupted by decoding.
+    """
+    try:
+        size = os.path.getsize(log_path)
+    except OSError:
+        return [], 0
+    if offset > size:
+        offset = 0  # rotated/truncated under us → resend from the start
+    if size <= offset:
+        return [], offset
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(offset)
+            chunk = f.read()
+    except OSError:
+        return [], offset
+    cut = chunk.rfind(b"\n")
+    if cut < 0:
+        return [], offset  # nothing complete yet — keep waiting
+    text = chunk[: cut + 1].decode("utf-8", "replace")
+    return text.splitlines(True), offset + cut + 1
 
 
 def _position_mark_price(pos, amount):
@@ -902,15 +1046,24 @@ def build_status_payload(env_config, db_path):
 
         now = time.time()
         watch = list(monitored_symbols)
-        if (
+        due = (
             not isinstance(_ROADMAP_CACHE.get("data"), dict)
-            or now - _ROADMAP_CACHE.get("ts", 0) > 600
+            or now - _ROADMAP_CACHE.get("ts", 0) > _ROADMAP_RETRY_S
             # A rotated watchlist invalidates the cache immediately: the floors
             # and prices already fetched belong to the OLD symbols, so serving
             # them for up to 10 more minutes would report on pairs the engine has
             # dropped and omit the ones it just picked up.
             or _ROADMAP_CACHE.get("pairs") != watch
+        )
+        # A refresh that FAILED is backed off (see _ROADMAP_CACHE). Bounded and
+        # small: the card keeps the last good snapshot and says how old it is.
+        if (
+            due
+            and now - _ROADMAP_CACHE.get("fail_ts", 0.0)
+            < _ROADMAP_FAIL_BACKOFF_S
         ):
+            due = False
+        if due:
             eq = (
                 _safe_float(db_data.get("risk", {}).get("total_equity"), 0.0)
                 or None
@@ -918,11 +1071,18 @@ def build_status_payload(env_config, db_path):
             # An empty watchlist (engine has not published) lets capital_roadmap
             # fall back to its CLI default list; `pairs_source` records which one
             # was used so the card can say so.
-            _ROADMAP_CACHE["data"] = (
-                compute_roadmap(eq, pairs=watch) if eq else None
-            )
-            _ROADMAP_CACHE["ts"] = now
-            _ROADMAP_CACHE["pairs"] = watch
+            try:
+                _ROADMAP_CACHE["data"] = (
+                    compute_roadmap(eq, pairs=watch) if eq else None
+                )
+                _ROADMAP_CACHE["ts"] = now
+                _ROADMAP_CACHE["pairs"] = watch
+                _ROADMAP_CACHE["fail_ts"] = 0.0
+            except Exception:
+                # Unreachable/rate-limited exchange: record the attempt so the
+                # next retry waits, and keep serving the last good roadmap rather
+                # than blanking the card for one bad minute.
+                _ROADMAP_CACHE["fail_ts"] = now
         roadmap = _ROADMAP_CACHE.get("data")
         if isinstance(roadmap, dict):
             # The roadmap's numbers (equity, proven notional, stage progress) are a
@@ -1245,8 +1405,19 @@ def _ws_drop_client(sock):
 
 def _ws_broadcast(snapshot_json):
     """Send a pre-serialized status snapshot to every connected dashboard.
-    Serializes once, never blocks the HTTP thread on slow sockets."""
-    frame = _ws_encode_frame(snapshot_json, opcode=0x1)
+    Serializes once, never blocks the HTTP thread on slow sockets.
+
+    `_ws_encode_frame` concatenates onto a bytearray, so the JSON string must be
+    encoded first: passing it through raised TypeError on EVERY tick, which the
+    pusher's blanket `except` swallowed — so the 1s status push and the log tail
+    never reached a single client while the monitor looked healthy.
+    """
+    payload = (
+        snapshot_json.encode("utf-8")
+        if isinstance(snapshot_json, str)
+        else snapshot_json
+    )
+    frame = _ws_encode_frame(payload, opcode=0x1)
     with _ws_clients_lock:
         targets = list(_ws_clients)
     for sock in targets:
@@ -1277,36 +1448,37 @@ def _ws_periodic_pusher(env_config, db_path, log_path):
                 _ws_status_cache["json"] = snapshot_json
                 _ws_broadcast(snapshot_json)
 
-            # Incremental log tail: only when the file has grown since last push.
+            # Incremental log tail: complete records only. A half-written line
+            # is carried, never sent truncated (see _read_new_log_lines).
             if log_path:
-                try:
-                    size = os.path.getsize(log_path)
-                except OSError:
-                    size = 0
-                if size < last_log_size:
-                    last_log_size = 0  # rotated/truncated → resend the tail
-                if size > last_log_size:
-                    with open(
-                        log_path, "r", encoding="utf-8", errors="replace"
-                    ) as f:
-                        if last_log_size:
-                            f.seek(last_log_size)
-                        new_lines = f.readlines()
-                    last_log_size = size
-                    if new_lines:
-                        frame = _ws_encode_frame(
-                            json.dumps(
-                                {"type": "log", "lines": new_lines}, default=str
-                            ).encode("utf-8"),
-                            opcode=0x1,
-                        )
-                        with _ws_clients_lock:
-                            targets = list(_ws_clients)
-                        for sock in targets:
-                            try:
-                                sock.sendall(frame)
-                            except OSError:
-                                _ws_drop_client(sock)
+                if last_log_size == 0:
+                    # First push, or just after a rotation/truncation: seed with
+                    # the tail the HTTP fallback would serve, then continue from
+                    # the END of that tail. (Resuming at the tail's start offset
+                    # would re-send the whole tail on every tick while the file
+                    # is smaller than the window.) The previous behaviour
+                    # re-sent the WHOLE file here, up to 10 MB per frame.
+                    new_lines, _, last_log_size = _tail_log_window(
+                        log_path, DEFAULT_LOG_LINES
+                    )
+                else:
+                    new_lines, last_log_size = _read_new_log_lines(
+                        log_path, last_log_size
+                    )
+                if new_lines:
+                    frame = _ws_encode_frame(
+                        json.dumps(
+                            {"type": "log", "lines": new_lines}, default=str
+                        ).encode("utf-8"),
+                        opcode=0x1,
+                    )
+                    with _ws_clients_lock:
+                        targets = list(_ws_clients)
+                    for sock in targets:
+                        try:
+                            sock.sendall(frame)
+                        except OSError:
+                            _ws_drop_client(sock)
         except Exception:
             # The pusher must survive transient I/O errors (DB locked, etc.)
             time.sleep(1.0)
@@ -1541,91 +1713,125 @@ def read_database(db_path):
         except sqlite3.Error:
             pass
 
+        # Schema capability, resolved once: the engine adds orders.exit_reason on
+        # boot, so the monitor adapts to a pre-migration file instead of raising.
+        has_exit_reason = _orders_has_exit_reason(cur)
+
         try:
             orders = [
                 dict(row)
                 for row in cur.execute(
-                    "SELECT order_id, symbol, side, order_type, price, stop_price, quantity, executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price FROM orders ORDER BY created_at DESC LIMIT 25"
+                    "SELECT order_id, symbol, side, order_type, price, stop_price, quantity,"
+                    " executed_qty, status, created_at, updated_at, profit_loss, avg_fill_price"
+                    + (", exit_reason" if has_exit_reason else ", NULL AS exit_reason")
+                    + " FROM orders ORDER BY created_at DESC LIMIT 25"
                 ).fetchall()
             ]
             # Attach the REAL position-entry time AND entry price to each exit
             # row. The exit's own created_at is the exit moment; the actual entry
-            # is the latest FILLED BUY for that symbol AT OR BEFORE the exit
-            # (bisect over per-symbol chronological BUY lists) — a naive "latest
-            # BUY per symbol" dict would match older exits to newer buys once a
-            # symbol round-trips more than once. Best-effort: unmatched exits
-            # keep entry_ts/entry_price null. The entry PRICE matters: market
-            # orders store price=0 in this table, so without the BUY leg's
-            # avg_fill_price the dashboard shows "$0.00 → $0.5382".
+            # is the latest FILLED fill on the OPPOSITE side for that symbol AT OR
+            # BEFORE the exit (bisect over per-symbol chronological fill lists) —
+            # a naive "latest BUY per symbol" dict would match older exits to
+            # newer entries once a symbol round-trips more than once. Best-effort:
+            # unmatched exits keep entry_ts/entry_price null. The entry PRICE
+            # matters: market orders store price=0 in this table, so without the
+            # entry leg's avg_fill_price the dashboard shows "$0.00 → $0.5382".
+            #
+            # The entry leg is the OPPOSITE side of the exit: a long exits with a
+            # SELL (entry = last FILLED BUY), a short exits with a BUY (entry =
+            # last FILLED SELL). Keying the entry off `side='BUY'` alone silently
+            # treated every futures short exit as a non-exit and left its entry
+            # price null, so the dashboard filled the entry from the EXIT's own
+            # fill and rendered "X → X".
             try:
-                buys_by_symbol: dict = {}
+                fills_by_side: dict = {}
                 for r in cur.execute(
-                    "SELECT symbol, created_at, avg_fill_price FROM orders WHERE side='BUY' AND status='FILLED' AND created_at IS NOT NULL ORDER BY created_at ASC LIMIT 500"
+                    "SELECT symbol, side, created_at, avg_fill_price FROM orders"
+                    " WHERE side IN ('BUY','SELL') AND status='FILLED'"
+                    " AND created_at IS NOT NULL ORDER BY created_at ASC LIMIT 500"
                 ).fetchall():
-                    buys_by_symbol.setdefault(r["symbol"], []).append(
+                    key = (r["symbol"], str(r["side"] or "").upper())
+                    fills_by_side.setdefault(key, []).append(
                         (r["created_at"], r["avg_fill_price"])
                     )
                 for o in orders:
-                    if str(o.get("side") or "").upper() == "SELL":
-                        buys = buys_by_symbol.get(o.get("symbol")) or []
-                        exit_ts = o.get("created_at") or 0
-                        idx = (
-                            bisect.bisect_right([b[0] for b in buys], exit_ts)
-                            - 1
+                    # One exit predicate, shared with the stats aggregate: an exit
+                    # is a row the engine labelled (exit_reason) or a legacy row
+                    # with a non-zero realized PnL. Side is irrelevant.
+                    _pnl = _safe_float(o.get("profit_loss"))
+                    is_exit = bool(o.get("exit_reason")) or _pnl != 0.0
+                    o["entry_ts"] = None
+                    o["entry_price"] = None
+                    if is_exit:
+                        entry_side = (
+                            "BUY"
+                            if str(o.get("side") or "").upper() == "SELL"
+                            else "SELL"
                         )
+                        legs = (
+                            fills_by_side.get((o.get("symbol"), entry_side))
+                            or []
+                        )
+                        exit_ts = o.get("created_at") or 0
+                        idx = bisect.bisect_right([b[0] for b in legs], exit_ts) - 1
                         if idx >= 0:
-                            o["entry_ts"] = buys[idx][0]
-                            o["entry_price"] = buys[idx][1]
-                        else:
-                            o["entry_ts"] = None
-                            o["entry_price"] = None
+                            o["entry_ts"] = legs[idx][0]
+                            o["entry_price"] = legs[idx][1]
+                    # The engine records its OWN exit reason on the exit order
+                    # (trade_policy.evaluate_exit -> close_trade -> orders.exit_reason),
+                    # so serve that verbatim. Inferring a label from the PnL sign —
+                    # what this used to do — files every PROFITABLE protective stop
+                    # (a breakeven lock, an armed trail) as TAKE_PROFIT even though
+                    # the target was never reached, and the trailing-stop branch of
+                    # the dashboard's colouring could never fire.
+                    #
+                    # Legacy rows (written before the column existed) are still
+                    # inferred from the sign, but flagged — and a legacy PARTIAL
+                    # exit leg gets NO invented trigger, since the dashboard has a
+                    # truthful label for it (PARTIAL_EXIT).
+                    if o.get("exit_reason"):
+                        o["exit_reason"] = str(o["exit_reason"]).upper()
+                        o["exit_reason_inferred"] = False
+                    elif is_exit and str(o.get("status") or "").upper() == "FILLED":
+                        o["exit_reason"] = (
+                            "STOP_LOSS" if _pnl < 0 else "TAKE_PROFIT"
+                        )
+                        o["exit_reason_inferred"] = True
+                    elif is_exit:
+                        o["exit_reason"] = None
+                        o["exit_reason_inferred"] = True
                     else:
-                        o.setdefault("entry_ts", None)
-                        o.setdefault("entry_price", None)
-                    # Derive the engine's exit reason from the realized outcome
-                    # for clean FILLED exits: a loss is the stop firing, a gain
-                    # is the TP/trailing leg (both are wins; the exact trigger
-                    # is in the engine log). CANCELED rows are partial exits
-                    # (scale-outs/partial fills) and keep their own label.
-                    if (
-                        str(o.get("side") or "").upper() == "SELL"
-                        and str(o.get("status") or "").upper() == "FILLED"
-                        and o.get("profit_loss") is not None
-                    ):
-                        try:
-                            o["exit_reason"] = (
-                                "STOP_LOSS"
-                                if float(o["profit_loss"]) < 0
-                                else "TAKE_PROFIT"
-                            )
-                        except (TypeError, ValueError):
-                            o["exit_reason"] = "MARKET_EXIT"
+                        o["exit_reason"] = None
+                        o["exit_reason_inferred"] = False
             except sqlite3.Error:
+                # Degraded path: the frontend reads these keys unconditionally, so
+                # the contract is kept even when the join queries fail.
                 for o in orders:
                     o.setdefault("entry_ts", None)
                     o.setdefault("entry_price", None)
+                    o.setdefault("exit_reason", None)
+                    o.setdefault("exit_reason_inferred", False)
             result["orders"] = orders
         except sqlite3.Error:
             pass
 
         # Aggregate trade statistics.
-        # "Closed trades" = SELL exit orders that recorded a realized PnL. This is
-        # exactly how the engine finalizes exits (close_trade sets profit_loss on the
-        # SELL order and marks it FILLED), including partial-exit legs which are
-        # persisted as CANCELED SELL orders with a non-zero profit_loss. BUY entries,
-        # NEW orders and CANCELED attempts (profit_loss NULL) are excluded so the
-        # win/loss denominator can never be diluted by non-exits.
-        try:
-            stats_row = cur.execute(
-                "SELECT COUNT(*) as total_orders, "
-                "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN 1 ELSE 0 END) as closed_trades, "
-                "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 THEN 1 ELSE 0 END) as winning_trades, "
-                "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0 THEN 1 ELSE 0 END) as losing_trades, "
-                "SUM(CASE WHEN status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL THEN profit_loss ELSE 0 END) as total_pnl "
-                "FROM orders"
-            ).fetchone()
-        except sqlite3.Error:
-            stats_row = None
+        #
+        # A TRADE is not an exit ORDER. With scale-out enabled one trade produces
+        # several exit legs (a partial filled then CANCELED, then the final FILLED
+        # exit), so counting legs inflated `closed_trades` and the win-rate
+        # denominator: a trade that banked +1R and then stopped out on the runner
+        # was reported as one win AND one loss. Legs are now attributed to the
+        # trade they belong to — the next FILLED exit for that symbol — and the
+        # trade is classified by its NET PnL. The leg count is still published as
+        # `exit_legs`, so nothing is hidden, only relabelled.
+        #
+        # An exit row is identified by the engine's persisted `exit_reason` (written
+        # by close_trade) or, for rows predating that column, by a non-zero realized
+        # PnL. Identifying exits by the reason instead of by `side='SELL'` also makes
+        # the counts and the PnL sum cover the SAME rows — they used to disagree for
+        # a futures short, whose closing order is a BUY.
+        stats_row = _orders_stats_row(cur, has_exit_reason)
 
         closed_trades = int(stats_row["closed_trades"] or 0) if stats_row else 0
         winning_trades = (
@@ -1636,42 +1842,21 @@ def read_database(db_path):
             0, closed_trades - winning_trades - losing_trades
         )
         total_pnl = float(stats_row["total_pnl"] or 0.0) if stats_row else 0.0
+        exit_legs = int(stats_row["exit_legs"] or 0) if stats_row else 0
         win_rate = (
             round(winning_trades / closed_trades * 100, 1)
             if closed_trades > 0
             else 0.0
         )
-        avg_win = 0.0
-        if winning_trades > 0:
-            # Average of winning trades' PnL only (NOT total_pnl, which includes losses)
-            try:
-                win_row = cur.execute(
-                    "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0"
-                ).fetchone()
-            except sqlite3.Error:
-                win_row = None
-            avg_win = (
-                float(win_row[0] or 0.0) / winning_trades
-                if win_row and win_row[0]
-                else 0.0
-            )
-        avg_loss = 0.0
-        if losing_trades > 0:
-            # Sum of losing PnL only (avg_loss shown as a positive magnitude)
-            try:
-                loss_row = cur.execute(
-                    "SELECT SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0"
-                ).fetchone()
-            except sqlite3.Error:
-                loss_row = None
-            avg_loss = (
-                abs(float(loss_row[0] or 0.0)) / losing_trades
-                if loss_row and loss_row[0]
-                else 0.0
-            )
+        gross_win = float(stats_row["gross_win"] or 0.0) if stats_row else 0.0
+        gross_loss = float(stats_row["gross_loss"] or 0.0) if stats_row else 0.0
+        # avg_* are per TRADE (gross over the trade set), so avg_win * wins == gross_win
+        # and the profit factor is the same ratio computed the same way.
+        avg_win = gross_win / winning_trades if winning_trades > 0 else 0.0
+        avg_loss = gross_loss / losing_trades if losing_trades > 0 else 0.0
         profit_factor = (
-            (avg_win * winning_trades) / (avg_loss * losing_trades)
-            if (avg_loss * losing_trades) > 0
+            gross_win / gross_loss
+            if gross_loss > 0
             else (0.0 if total_pnl <= 0 else float("inf"))
         )
 
@@ -1680,6 +1865,7 @@ def read_database(db_path):
             if stats_row
             else 0,
             "closed_trades": closed_trades,
+            "exit_legs": exit_legs,
             "winning_trades": winning_trades,
             "losing_trades": losing_trades,
             "breakeven_trades": breakeven_trades,
@@ -1690,8 +1876,10 @@ def read_database(db_path):
             else None,
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
-            "win_streak": risk.get("win_streak", "0"),
-            "loss_streak": risk.get("loss_streak", "0"),
+            # Streaks are COUNTS: serve them as numbers, not the raw risk_state
+            # strings, so the dashboard never has to coerce before comparing.
+            "win_streak": int(_safe_float(risk.get("win_streak"))),
+            "loss_streak": int(_safe_float(risk.get("loss_streak"))),
             "daily_pnl": _safe_float(risk.get("daily_pnl")),
         }
 
@@ -1727,6 +1915,71 @@ def _safe_float(val, default=0.0):
     except (TypeError, ValueError):
         return default
     return f if math.isfinite(f) else default
+
+
+def _orders_has_exit_reason(cur):
+    """Has the engine's DB been migrated to persist exit reasons?
+
+    The ENGINE owns the schema and adds `orders.exit_reason` on boot (db_manager's
+    idempotent migration). The monitor opens the same file read-only and must not
+    migrate it, so it adapts to whichever schema it finds: on a pre-migration file
+    the column is selected as NULL and the exit predicate falls back to the
+    realized-PnL test. Without this, deploying the monitor ahead of the engine
+    would raise on every payload and blank the whole dashboard.
+
+    Delegates to trade_stats so the dependency (and the schema probe) is defined
+    once for the soak card, the watchdog, the report and the smoke test too.
+    """
+    return trade_stats.has_exit_reason(cur)
+
+
+def _orders_stats_row(cur, has_exit_reason=True):
+    """The raw aggregate row behind the dashboard's trade stats.
+
+    Counted per TRADE, not per exit order. `_orders_stats_row` is split out from
+    the payload builder so the attribution and its fallback are directly
+    testable with a stub cursor.
+
+    Returns a row (or dict) with total_orders / closed_trades / winning_trades /
+    losing_trades / gross_win / gross_loss / total_pnl / exit_legs, or None when
+    even the fallback query fails.
+
+    See `build_status_payload` for why a trade is not a leg.
+    """
+    exit_pred = trade_stats.exit_predicate(has_exit_reason)
+    # The attribution CTE is shared with the soak card, the soak watchdog, the
+    # post-soak report and the smoke test's cross-check (trade_stats).
+    trade_stats_sql = trade_stats.trade_cte(exit_pred) + (
+        " SELECT (SELECT COUNT(*) FROM orders) AS total_orders,"
+        "  (SELECT COUNT(*) FROM trades) AS closed_trades,"
+        "  (SELECT COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) FROM trades) AS winning_trades,"
+        "  (SELECT COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) FROM trades) AS losing_trades,"
+        "  (SELECT COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0) FROM trades) AS gross_win,"
+        "  (SELECT COALESCE(SUM(CASE WHEN pnl < 0 THEN -pnl ELSE 0 END), 0) FROM trades) AS gross_loss,"
+        "  (SELECT COALESCE(SUM(profit_loss), 0) FROM legs) AS total_pnl,"
+        "  (SELECT COUNT(*) FROM legs) AS exit_legs"
+    )
+    legs_agg = (
+        "COUNT(*) as total_orders, "
+        f"SUM(CASE WHEN {exit_pred} THEN 1 ELSE 0 END) as closed_trades, "
+        f"SUM(CASE WHEN {exit_pred} AND profit_loss > 0 THEN 1 ELSE 0 END) as winning_trades, "
+        f"SUM(CASE WHEN {exit_pred} AND profit_loss < 0 THEN 1 ELSE 0 END) as losing_trades, "
+        f"SUM(CASE WHEN {exit_pred} AND profit_loss > 0 THEN profit_loss ELSE 0 END) as gross_win, "
+        f"SUM(CASE WHEN {exit_pred} AND profit_loss < 0 THEN -profit_loss ELSE 0 END) as gross_loss, "
+        f"SUM(CASE WHEN {exit_pred} THEN profit_loss ELSE 0 END) as total_pnl, "
+        f"SUM(CASE WHEN {exit_pred} THEN 1 ELSE 0 END) as exit_legs "
+    )
+    try:
+        return cur.execute(trade_stats_sql).fetchone()
+    except sqlite3.Error:
+        pass
+    # Legacy fallback: a SQLite without window functions (< 3.25) or a malformed
+    # legacy file degrades to the previous LEG-based aggregate rather than losing
+    # the whole stats block.
+    try:
+        return cur.execute(f"SELECT {legs_agg} FROM orders").fetchone()
+    except sqlite3.Error:
+        return None
 
 
 def _fapi_balance_rows(account):
@@ -2098,11 +2351,22 @@ def fetch_scanned_pairs(env_config, db_data):
     if isinstance(db_scanned, list) and len(db_scanned) > 0:
         _scanned_cache["ts"] = now
         _scanned_cache["data"] = db_scanned
+        _scanned_cache["fail_ts"] = 0.0
         return db_scanned
 
-    # Check cache (15s TTL)
-    if _scanned_cache["data"] and (now - _scanned_cache["ts"] < 15.0):
-        return _scanned_cache["data"]
+    # Check cache (15s TTL). The gate is on the ATTEMPT timestamp, not on the
+    # data being truthy: a fetch that legitimately returned no qualifying symbol
+    # (an unusual QUOTE_ASSET, a quiet market) is still a successful read of the
+    # exchange, and re-querying it once a second for that reason is the same
+    # stall this cache exists to prevent.
+    if _scanned_cache["ts"] and (now - _scanned_cache["ts"] < _SCANNED_TTL_S):
+        return _scanned_cache["data"] or []
+
+    # A FAILED fetch is backed off: serve the last good screener (an empty list
+    # is truthful when there has never been one) instead of blocking another
+    # payload build on the same dead request.
+    if now - _scanned_cache["fail_ts"] < _SCANNED_FAIL_BACKOFF_S:
+        return _scanned_cache["data"] or []
 
     quote = env_config.get("QUOTE_ASSET", "USDT").strip().upper()
     static_symbols = [
@@ -2201,10 +2465,15 @@ def fetch_scanned_pairs(env_config, db_data):
 
                 _scanned_cache["ts"] = now
                 _scanned_cache["data"] = candidates
+                _scanned_cache["fail_ts"] = 0.0
                 return candidates
     except Exception:
         pass
 
+    # The attempt produced no screener (unreachable, non-200, unparseable):
+    # stamp it so the next payload build serves the cache instead of blocking
+    # on the same request again.
+    _scanned_cache["fail_ts"] = now
     return _scanned_cache["data"] or []
 
 
@@ -3149,6 +3418,13 @@ def start_web_server(port, env_config, db_path):
                     return
             except OSError:
                 return
+            # Register the socket BEFORE streaming: the periodic pusher only
+            # sends to clients in `_ws_clients`, so a session missing from it
+            # receives the hello/initial snapshot and then NOTHING — the 1s
+            # status push and every log tail silently never arrive, and the
+            # dashboard believes it is on the live channel while polling.
+            with _ws_clients_lock:
+                _ws_clients.add(self.connection)
             # Stream synchronously in THIS connection's thread: returning from
             # do_GET would let http.server re-use/close the socket after its
             # idle timeout, killing live sessions. ThreadingHTTPServer gives
@@ -3174,10 +3450,9 @@ def start_web_server(port, env_config, db_path):
 
             if clean_path == "/api/logs":
                 query = parse_qs(urlparse(self.path).query)
-                try:
-                    lines = min(int(query.get("lines", ["120"])[0]), 500)
-                except ValueError:
-                    lines = 120
+                lines = clamp_log_lines(
+                    query.get("lines", [str(DEFAULT_LOG_LINES)])[0]
+                )
                 log_path = env_config.get("LOG_FILE", "./logs/trading.log")
                 self._send_json({"lines": tail_log_file(log_path, lines)})
                 return

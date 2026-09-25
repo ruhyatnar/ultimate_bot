@@ -2,6 +2,7 @@ import React from 'react';
 import { Activity, Signal, Radio, Wifi, WifiOff, PauseCircle, ShieldAlert, Gauge, Clock } from 'lucide-react';
 import { WsStreams, EngineRiskState } from '../types';
 import { StreamLights } from './StatusCards';
+import { ENGINE_FRESHNESS_S, engineIsStale } from '../utils/freshness';
 
 interface EngineHealthCardProps {
   streams: WsStreams | null;
@@ -10,7 +11,14 @@ interface EngineHealthCardProps {
   controlPaused: boolean;
   engineRisk: EngineRiskState | null;
   breakerTripped: boolean;
+  /**
+   * Decision-loop cadence to display. The engine's OWN published interval when
+   * its heartbeat carries one, else the configured SIGNAL_INTERVAL — see
+   * `intervalFromEngine`, which says which of the two this is.
+   */
   scanInterval: number;
+  /** True when `scanInterval` came from the engine heartbeat rather than config. */
+  intervalFromEngine: boolean;
   /** Age of the engine's decision-loop heartbeat (falls back to the newest signal snapshot). */
   loopAgeS: number | null;
   /** True when the age above came from the engine's heartbeat rather than the snapshot heuristic. */
@@ -37,11 +45,24 @@ export const EngineHealthCard: React.FC<EngineHealthCardProps> = ({
   engineRisk,
   breakerTripped,
   scanInterval,
+  intervalFromEngine,
   loopAgeS,
   loopFromHeartbeat,
   pauseApplied
 }) => {
-  const engineStale = typeof streams?.engine_age_s === 'number' && streams.engine_age_s > 30;
+  // One freshness budget for the whole app (utils/freshness) — the stream lights
+  // and this card must never disagree about the same payload.
+  const engineStale = engineIsStale(streams?.engine_age_s);
+  // Streak cooldowns block entries but leave open positions managed, so the row
+  // says so instead of leaving the chip to imply the breaker is the only guard.
+  const activeCooldownMap = (engineRisk?.active_cooldowns ?? {}) as Record<
+    string,
+    { until: number; kind: string }
+  >;
+  const activeSymbolCooldowns = Object.entries(activeCooldownMap)
+    .filter(([, v]) => (v?.until ?? 0) * 1000 > Date.now());
+  const cooldownActive =
+    (engineRisk?.cooldown_until ?? 0) * 1000 > Date.now() || activeSymbolCooldowns.length > 0;
   const loopAge = typeof loopAgeS === 'number' ? loopAgeS : null;
   const loopOk = loopAge !== null && loopAge <= Math.max(60, scanInterval * 6);
   const loopTone = loopAge === null ? 'text-slate-400' : loopOk ? 'text-emerald-300' : 'text-amber-300';
@@ -84,10 +105,14 @@ export const EngineHealthCard: React.FC<EngineHealthCardProps> = ({
         <Row
           icon={<Gauge className="h-3.5 w-3.5" />}
           label="Process"
-          ok={engineRunning ? !engineStale : false}
-          title={engineStale
-            ? 'The engine has not published health recently — it may be hung or stopped'
-            : 'Engine process reports RUNNING via /api/status'}
+          ok={engineRunning && !engineStale}
+          title={
+            !engineRunning
+              ? 'The engine\'s own process status (/api/status `process`) does not report RUNNING — it is stopped or failed to start.'
+              : engineStale
+                ? `The process reports RUNNING but its health snapshot is older than ${ENGINE_FRESHNESS_S}s — it may be hung mid-iteration (a wedged loop keeps the process alive).`
+                : 'The engine reports RUNNING and its health snapshot is fresh.'
+          }
         >
           <span className={`num text-xs font-bold ${engineRunning ? 'text-emerald-300' : 'text-rose-300'}`}>
             {engineRunning ? 'RUNNING' : 'DOWN'}
@@ -157,27 +182,61 @@ export const EngineHealthCard: React.FC<EngineHealthCardProps> = ({
           ok={loopAge === null ? null : loopOk}
           title={
             loopFromHeartbeat
-              ? `Age of the engine's decision-loop heartbeat, written every iteration on every path (trading, paused, health-pause). The loop runs every ${scanInterval}s — a frozen age means the loop itself is wedged.`
+              ? `Age of the engine's decision-loop heartbeat, written every iteration on every path (trading, paused, health-pause). The loop runs every ${scanInterval}s${
+                  intervalFromEngine
+                    ? ' (the engine\'s own published cadence)'
+                    : ' (configured SIGNAL_INTERVAL — this engine publishes no cadence)'
+                } — a frozen age means the loop itself is wedged.`
               : `Age of the engine's last per-symbol signal snapshot (no heartbeat published by this build). It only advances when a symbol passes every gate, so it can read old while the engine is healthy — pausing or a full book freezes it.`
           }
         >
           <span className={`num text-xs font-bold ${loopTone}`}>
             {loopAge === null ? 'no data' : `${loopAge < 90 ? `${Math.round(loopAge)}s` : `${Math.round(loopAge / 60)}m`} ago`}
           </span>
-          <span className="num text-[10px] text-slate-500">every {scanInterval}s</span>
+          <span
+            className="num text-[10px] text-slate-500"
+            title={intervalFromEngine
+              ? "The engine's own published loop interval"
+              : 'Configured SIGNAL_INTERVAL — the engine publishes no interval'}
+          >
+            every {scanInterval}s
+          </span>
         </Row>
 
         <Row
           icon={<Activity className="h-3.5 w-3.5" />}
           label="Risk guardrails"
           ok={engineRisk ? !breakerTripped : null}
-          title="Daily drawdown breaker and streak cooldown state (engine-owned)"
+          title={
+            engineRisk
+              ? 'The engine\'s own guardrails: the daily-drawdown circuit breaker (armed / tripped) and any active streak cooldown. A cooldown blocks NEW entries but keeps managing open positions.'
+              : 'The engine has not published a risk snapshot yet (engine_risk): breaker and cooldown state are UNKNOWN, not clear.'
+          }
         >
           <span className={`text-xs font-bold ${breakerTripped ? 'text-rose-300' : 'text-emerald-300'}`}>
             {engineRisk
               ? breakerTripped ? 'BREAKER TRIPPED' : 'armed'
               : 'no data'}
           </span>
+          {engineRisk && cooldownActive && (
+            <span
+              className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                engineRisk.cooldown_kind === 'win'
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+              }`}
+              title={
+                `Entries blocked by the ${engineRisk.cooldown_kind === 'win' ? 'win' : 'loss'}-streak cooldown${
+                  activeSymbolCooldowns.length > 0
+                    ? ` — symbols: ${activeSymbolCooldowns.map(([s]) => s).join(', ')}`
+                    : ''
+                }. Open positions stay managed.`
+              }
+            >
+              <PauseCircle className="h-3 w-3" />{' '}
+              {engineRisk.cooldown_kind === 'win' ? 'win cooldown' : 'loss cooldown'}
+            </span>
+          )}
         </Row>
       </div>
     </section>

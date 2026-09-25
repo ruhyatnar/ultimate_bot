@@ -26,6 +26,251 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 
 ## 📝 Changelog
 
+### 2026-09-25 (11) — Screener cache: a dead ticker endpoint stalled the 1 Hz payload path
+
+**The last blocking network read in `build_status_payload` without a failure backoff.** The capital
+roadmap got one in the previous pass; `fetch_scanned_pairs` did not, and its flaw was harder to see
+because the cache *looked* correct.
+
+- **The 15s TTL was gated on the cached *data* being truthy, not on the attempt time.** After a
+  failed fetch `_scanned_cache["ts"]` stayed `0`, so `now - ts < 15` was never true and the gate was
+  never entered: one `urlopen(..., timeout=4.0)` went in front of **every** payload build. The `/ws`
+  pusher builds a payload once a second, so an unreachable (or geo-blocked) `api.binance.com` stalled
+  the realtime status **and** log stream behind a 4s request — a build could only complete every ~5
+  seconds instead of once a second (measured on the pre-fix code: five builds, five attempts).
+- **An empty-but-successful screener relapsed identically.** A response that parses fine but selects
+  no symbol (`[]`) also left the truthy-gated TTL unsatisfied, so a quiet market or an unusual
+  `QUOTE_ASSET` re-queried the exchange once a second, forever. The TTL is about how long ago we last
+  *asked*, not about whether the answer had rows in it.
+- **The monitor reaches this path exactly when it matters most.** `risk_state.scanned_pairs` — the
+  engine's own screener output — short-circuits the network entirely, but it is absent precisely when
+  the engine is **stopped**, which is when the dashboard is the thing you are looking at.
+- **Fix:** the gate is the attempt timestamp now; a failed attempt stamps `fail_ts` and is backed off
+  (`_SCANNED_FAIL_BACKOFF_S = 60s`), so a dead endpoint costs one request a minute instead of one a
+  second; the last good list keeps being served rather than blanking the card; and a success clears
+  `fail_ts` so a later failure re-arms instead of being swallowed by a stale stamp. Engine-published
+  pairs still bypass the network completely, and the two magic numbers got names
+  (`_SCANNED_TTL_S` / `_SCANNED_FAIL_BACKOFF_S`) next to the cache they govern.
+
+**New checks (`test_scenarios.py` S15, 6 — all mutation-verified against the pre-fix code):**
+
+- a failed screener fetch is attempted once across five consecutive payload builds, then backed off;
+- the retry resumes once the backoff expires (no permanent "never refresh again" state);
+- engine-published `scanned_pairs` short-circuit the network entirely (zero attempts);
+- a later failed fetch keeps serving the last good screener instead of blanking the card;
+- an empty-but-successful fetch is cached once for the TTL, not re-read on every build;
+- a success clears the backoff, so a subsequent failure re-arms it.
+
+Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (108) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys, untouched).
+
+### 2026-09-24 (10) — Stats / roadmap / soak audit: three readers, three different books
+
+**`build_status_payload`'s remaining surfaces (stats, roadmap, soak) and every script that feeds
+them were audited.** All findings were reproduced against purpose-built SQLite fixtures; the roadmap
+one was reproduced against the running monitor.
+
+- **The capital-roadmap refresh had no failure backoff.** The roadmap is the only blocking network
+  I/O in the payload path (`capital_roadmap.http_get_json`, 15s timeout per call — exchangeInfo +
+  prices + one funding call per pair) and the `/ws` pusher builds the payload once a **second**. A
+  raised refresh left `_ROADMAP_CACHE["ts"]` untouched, so the "10-minute cache" became "retry on
+  every request" the moment fapi was unreachable. Removing the new guard makes `sync_test.py`'s own
+  HTTP reads time out, which is what the live monitor would do to every dashboard. Now: the attempt
+  is stamped (`_ROADMAP_FAIL_BACKOFF_S`, 120s), the last good roadmap keeps being served, and
+  `age_s` still tells the operator how old it is.
+- **`soak_watchdog.py` reported a soak that never traded.** `soak_metrics()` counted
+  `status='CLOSED'` — the engine writes NEW/FILLED/PARTIALLY_FILLED/CANCELED/EXPIRED/REJECTED and
+  never CLOSED — so the watchdog's every message (the deadline COMPLETE report and both alert
+  summaries) said `closed: 0 (W 0 / L 0, winrate 0%)`, `PnL: $+0.0000 (+0.00%)`, `start $0.00`,
+  `daily DD 0.00%`, `L0`. Two more keys it read do not exist either: `lose_streak` (the engine
+  persists `loss_streak`, and `engine_risk` carries the value to DISPLAY — the streak that tripped
+  an active cooldown rather than the reset counter) and `paper_start_balance`/`max_drawdown_pct`
+  (never written; drawdown-used is published in `engine_risk`). The starting balance is derived from
+  the paper balance net of realized PnL.
+- **The Futures Soak card counted the wrong trades.** `_futures_soak_snapshot` used the legacy
+  `side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL` predicate — the exact
+  assumption the dashboard's stats had already dropped — in a **futures** soak, where a short's
+  closing order is a **BUY**. Every short was missing from `closed`/`wins`/`losses`/`pnl`, and a
+  scale-out's partial leg + final leg were counted as two separate trades. It now uses the shared
+  definition (below), so the card reconciles with the dashboard for the same book.
+- **`last_trade_ms` was `MAX(updated_at)` over EVERY order.** `updated_at` moves on any order write
+  (an entry fill, a cancel), so an order placed after the last exit re-dated the card's "Last". It
+  is now the newest **exit** row's own `created_at`.
+- **The card's soak length came from the import-time process env, not the live config.**
+  `_SOAK_HOURS` is read once at import from `os.getenv`, while `soak_watchdog.py` reads `.env`
+  (`load_dotenv`). A `.env` `SOAK_HOURS` would have left `hours_total`/`deadline_ms`/the progress
+  bar at 24h while the supervisor enforced a different deadline — the drift the config-refresh path
+  exists to prevent. It is resolved from the `env_config` the function already received.
+- **`side='SELL'` had also been copied into `soak_report.py` and `smoke_test.py`.** The same
+  mistake lived in four places, each looking plausible in isolation, so the definition moved into
+  **`trade_stats.py`**: one `exit_predicate()` (the engine's `exit_reason`, else a legacy non-zero
+  PnL — never the side), one schema probe (`has_exit_reason`, for DBs written before the migration),
+  and one leg→trade attribution CTE (`trade_cte`), now used by the monitor's stats, the soak card,
+  the watchdog, the post-soak report and the smoke cross-check. The engine keeps its own copy in
+  `src/trade/trade_logic.py` (it runs as a package and must not import a monitor-side script); the
+  suites check the two against each other instead of sharing them by import.
+- **`browser_smoke.py` compared the card to a payload fetched BEFORE navigating.** The page is fed by
+  the 1 Hz `/ws` push and the engine's screener rotates the watchlist (which re-partitions
+  ok/blocked pairs), so a rotation between the two reads failed a healthy dashboard — observed as
+  `[FAIL] every viable pair renders a chip — missing: ['ZROUSDT']` while every other roadmap check
+  passed. The card and a freshly fetched payload are now re-read **together** (up to 4 attempts)
+  until self-consistent, and the same strict DOM-vs-payload checks run on that pair; a genuine
+  disagreement is still reported, never retried away.
+
+**New checks (all mutation-verified against the pre-fix code):**
+
+- `test_scenarios.py` **S13** (13) — `trade_stats` sees a short's BUY exit and counts a scale-out's
+  two legs as ONE trade with the net PnL; the schema probe keeps a legacy DB queryable; the soak card
+  counts the short, nets the scale-out, dates "last trade" by the newest EXIT (not a later entry's
+  `updated_at`), serves the soak DB's own equity and takes its length from the live config; and the
+  watchdog's tally/summary agrees with the card while reading the engine's real `loss_streak` and
+  deriving a non-zero starting balance.
+- `test_scenarios.py` **S14** (3) — the browser check's re-read predicate: an agreed pair is not
+  re-read, a rotated watchlist triggers a re-read instead of a failure, and a real threshold
+  disagreement is still detected.
+- `test_scenarios.py` **S15** (6) — the market screener's cache: a failed fetch is attempted once then
+  backed off, the retry resumes after the backoff, engine-published pairs short-circuit the network,
+  the last good list survives a failure, an empty-but-successful fetch is cached once, and a success
+  clears the backoff so a later failure re-arms it.
+- `sync_test.py` **E3** additions (4) — a failed roadmap refresh is attempted once then backed off,
+  the last good roadmap survives it, the retry resumes after the backoff, and the payload always
+  carries a `soak` section (null hides the card; E4).
+
+Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (102) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys, untouched).
+
+### 2026-09-24 (9) — Engine-log & realtime-push audit: the WS channel was dead, the log was not a log
+
+**The Engine Log tab and the whole `/ws` push channel were audited against the live monitor.**
+Every finding below was reproduced on the running system (or on a purpose-built harness), not
+inferred from reading code.
+
+- **`_ws_broadcast` crashed on every tick — the monitor pushed nothing, ever.** It handed a JSON
+  **`str`** to `_ws_encode_frame`, which concatenates onto a `bytearray` (`bytes(header) + payload`),
+  so the broadcast raised `TypeError: can't concat str to bytes` on its first call — and the
+  pusher's blanket `except Exception: time.sleep(1.0)` swallowed it. The 1s status push and every
+  log tail never reached a single client. `_ws_client_thread` encodes explicitly (and kept working),
+  which is why `/ws` *looked* alive: a connecting dashboard got `hello` + one snapshot and then
+  silence, while the badge said `WS LIVE` and every update actually arrived by HTTP polling. The
+  2026-09-19 audit entry below ("realtime audit — no changes needed") is wrong on this point; this
+  entry supersedes it. Verified with a raw frame-level probe: before the fix `{hello: 1, status: 1}`
+  in 10s; after it, a status frame every second plus the log tail.
+- **Client sockets were never registered.** Nothing called `_ws_clients.add(...)` — only `discard`,
+  `list` and `len` did — so even a fixed broadcast had no targets (`if active == 0: continue`
+  short-circuits the entire pusher body). The socket is now registered immediately after the 101
+  handshake, before the per-connection stream starts.
+- **In the engine log, 91% of lines were invisible — permanently.** The Engine Log deduped on
+  `level + message[:80]`, ignoring the timestamp, in a `Set` that only cleared past 4,000 entries.
+  The live log is 3,985 lines of which **376** are distinct under that key: a repeated steady-state
+  line (the equity update alone appears **264×**) was shown once and then never again, so the panel
+  — labelled "Live engine log stream" — was a de-duplicated *set* that never tailed. Two distinct
+  events sharing an 80-char prefix also collapsed into one. Identity is now the **whole raw line**,
+  with FIFO eviction of the oldest quarter (a wholesale `clear()` re-admitted all 120 lines still in
+  the polled tail), shared by the WS push and the HTTP poller through one new module
+  (`src/utils/engineLog.ts`) so the two transports cannot disagree.
+- **Every displayed line carried the browser's clock, not the engine's.** The console stamped each
+  line with `new Date()` on arrival, so a 120-line tail rendered with ~120 identical timestamps (the
+  poll moment). The engine's own `HH:MM:SS` is now parsed off the line.
+- **`/api/logs?lines=` served the ENTIRE log for `0` or any negative.** `min(int(v), 500)` had no
+  lower bound, so `lines=0` reached `readlines()[-0:]` (the whole file) and `lines=-3` reached
+  `readlines()[3:]` (nearly the whole file): a **10 MB** JSON response per request on an
+  unauthenticated URL the browser polls every 5s. Clamped to `1..500`, junk → 120, and the tail is
+  now read by a **bounded backward block scan** instead of `readlines()` slurping the file each poll.
+- **A record caught mid-write was served truncated, then lost.** The incremental pusher resumed at
+  `size` after `readlines()`, so a line the engine had half-written arrived cut off and the rest of
+  it was skipped forever; `tail_log_file` had the same defect. Both readers now keep only
+  **newline-terminated** records — the fragment is carried (bytes are read raw, so a split
+  multi-byte character is not corrupted) and delivered once its newline lands. Verified live: the
+  fragment was carried, then delivered whole (and correctly *merged* with the next write).
+- **The first push of every session re-sent the whole file.** Seeding was `last_log_size = 0` → read
+  from byte 0, up to 10 MB per frame on the first client after a monitor start (and after every
+  rotation). The seed is now the same bounded tail `/api/logs` serves, and the pusher resumes from
+  that tail's **end** offset (resuming at its start re-sent the tail every tick while the file was
+  smaller than the window — caught by the frame probe as 3 log frames/second).
+- **A measured `0 ms` clock offset was treated as "never measured".** Both REST clients initialised
+  `time_offset = 0` and re-synced whenever it was `0` — so a local clock that genuinely matched
+  Binance to the millisecond forced a fresh `/api/v3/time` (or `/fapi/v1/time`, which bypasses the
+  rate limiter on futures) before **every signed request**, doubling order latency. `None` is now the
+  sentinel (`WSApiClient` already used it), so `0` means 0 ms end to end — including the Engine
+  Health **Clock sync (Binance)** row, which previously could show a false `+0ms` before the first
+  real measurement instead of `no data`. `live_signed_probe.py` reads the same field and now names
+  a failed sync (`no measurement … investigate NTP`) instead of crashing on `abs(None)` — the one
+  case where you most need that probe to speak. Verified live: `npm run probe` ALL GREEN
+  (`Clock offset — -58 ms vs exchange (synced 0.4s ago)`, signed read accepted, no `-1021`).
+- **Unstructured lines were dropped.** Python tracebacks (`Traceback (most recent call last):`, each
+  `  File "…"` frame) matched neither pattern and vanished, so an `ERROR` reached the console with no
+  stack. They are now folded into the record they belong to (rendered with `whitespace-pre-wrap`).
+- Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 74/74 · scenarios ALL_OK · browser
+  BROWSER_OK**, `.env` ≡ `.env.example` (90 keys). New checks: `sync_test.py` **B2/H** (`the monitor
+  PUSHES status over /ws`, the `/api/logs` clamp + whole-record contract, the live `/ws` log push)
+  and `test_scenarios.py` **S12/S12b** (tail clamp, block-stitching, partial-record carry, rotation,
+  the `0 ms` sentinel on both clients). Every new check was mutation-verified against the pre-fix
+  code: reverting the client registration, the `str`→bytes encode, the clamp, the offset advance,
+  the key, the timestamp or the FIFO eviction each fails the intended check.
+
+### 2026-09-23 (8) — Exit attribution & engine-health audit: the served reason, count and source
+
+An audit of the web monitor's *Recent Completed Trades* and *Engine Health* panels against the live
+database found nine defects. All are fixed, and every fix is guarded by a test that was
+**mutation-tested** against the pre-fix code.
+
+- **The exit reason was inferred from the PnL sign and was provably wrong.** `status.py` derived the
+  label (`pnl < 0 → STOP_LOSS`, else `TAKE_PROFIT`) while the engine had always computed the real
+  reason in `trade_policy.evaluate_exit` and only **logged** it. Against the engine's own log for the
+  same 12 exits: engine **17 × `STOP_LOSS`**, dashboard **8 × `TAKE_PROFIT`** — a position closing at
+  **+0.21** on a protective stop was badged as a take-profit win. Fixed by persisting the reason on
+  the exit order: `db_manager.init_db()` adds `orders.exit_reason` (idempotent `ALTER TABLE`, the same
+  pattern as the `risk_state.updated_at` migration) and `close_trade` writes it on every exit leg,
+  partial included. `status.py` serves it verbatim, flags rows it still has to infer
+  (`exit_reason_inferred`), and leaves a legacy partial leg's reason null so the UI shows
+  `PARTIAL_EXIT` instead of an invented trigger. The monitor adapts to a **pre-migration** file
+  (`NULL AS exit_reason` + the old predicate) rather than migrating the engine's database itself.
+- **A trade was counted as a leg.** With scale-out on, one trade writes a partial leg and a final
+  leg, so `closed_trades` and the win-rate denominator were inflated — a trade that banked +1R and
+  then stopped out on the runner was **one win and one loss**. `_orders_stats_row()` now attributes
+  every leg to its trade (a window function over the symbol's next FILLED exit; a leg with no FILLED
+  exit after it — a banked partial of a still-open position — becomes its own trade, so the nets
+  always sum to `total_realized_pnl`) and classifies the trade by its **net** PnL. `exit_legs`
+  publishes the raw count. Falls back to the leg-based aggregate on a SQLite without window
+  functions.
+- **Exits were identified by `side='SELL'`.** A futures short closes with a **BUY**: invisible to the
+  monitor's stats and to the frontend's filter, and its entry leg was matched from the wrong side, so
+  the row rendered `X → X`. `_send_daily_report` counted the same way, so the Discord report and the
+  dashboard disagreed with each other. All three now share one predicate (engine-labelled, or a
+  legacy row with a non-zero PnL) and match the entry from the **opposite** side.
+- **Streaks were served as raw `risk_state` strings**; `stats.win_streak` / `loss_streak` are numbers.
+- **Engine health read the wrong sources.** The *Process* row inferred liveness from snapshot
+  freshness (`connected && age ≤ 30`), so a **stopped** engine with a fresh last snapshot read
+  RUNNING, and the engine's own `process` state — already parsed by `App.tsx` — was never consulted;
+  it is now the source, with freshness as an additional red condition. The *Decision loop* row
+  displayed the browser's `SIGNAL_INTERVAL` instead of the cadence the heartbeat publishes. The
+  *Risk guardrails* row claimed cooldown state while rendering only the breaker, so a streak cooldown
+  that blocks every entry was invisible — it now names the cooldown kind. The 30 s freshness budget,
+  previously three separate literals, is one shared constant (`src/utils/freshness.ts`).
+- **Verification:** sync **61/61** (new **D2**: the boot migration, reason served verbatim, legs not
+  trades, a short's BUY exit, inferred flags, numeric streaks, and an independent exit-predicate sum
+  of the realized total), scenarios **60 checks** incl. new **S11** (14), UI **26/26**, smoke 13/13,
+  `tsc --noEmit` clean, `check:env` IN SYNC (90 keys). **Not deployed** — the engine must reload for
+  the migration and reason persistence, and the monitor must be rebuilt and reloaded.
+
+### 2026-09-23 (7) — A real browser render check, which skips when it cannot run
+- **Nothing in the battery ran a browser.** `smoke_test.py` boots the engine, `sync_test.py` compares the monitor's payload to it, and `scripts/ui_smoke.mjs` renders the React tree to **static markup** — so a defect existing only once the page is laid out (a bundle that 404s after a deploy, a card inside a `display:none` container, a chip rendering a constant instead of the served value, a component throwing while live) had no check at all. New **`browser_smoke.py`** launches a headless Chromium and drives it over the **Chrome DevTools Protocol** directly — no Playwright/Puppeteer dependency, nothing downloaded — loads the running monitor, and makes 15 assertions about the rendered DOM. See [Browser Render Check](#browser-render-check-browser_smokepy).
+- **Every rendered figure is compared to its source, not to a constant.** The script fetches the same `/api/status` the page fetched and requires the card's chips to agree with `roadmap.pairs[].required_equity`, so a chip that regressed to a literal `$24` fails even on a day when `$24` is right for a *different* pair. The universe label must match the served `pairs_source` **and** the served pair count. A mutation test confirmed the assertions have teeth: a hardcoded chip, a missing threshold, a threshold invented for a pair with no served value, a missing viable pair, and a wrong universe label each fail.
+- **It skips rather than lying.** Chromium is auto-discovered (`--chrome`, `$CHROME_BIN`, `PATH`, the Playwright cache, the Puppeteer cache); with no browser *or* no reachable monitor it prints `SKIP` and exits 0 — the `check_env_drift.py` convention — so `npm run verify` stays green on a machine that has neither. `--strict` turns those skips into failures for a host that should have both. Both skip paths and both `--strict` inversions were exercised.
+- **Wired in as `npm run test:browser`, last in `npm run verify`.** Live run: **15/15, `BROWSER_OK`**, against the deployed bundle — 5 desk sections, 5 tabs, no JS exceptions, no render-bug canaries, and `BTCUSDT @ $60` agreeing with the served `required_equity` of `60.0`. The only failed request is the browser's own automatic `/favicon.ico` probe, which is noted and never failed on.
+- **Wiring it in earned its keep immediately: it surfaced two flaky `E2` checks.** The first full `verify` with the new step reported `46/48`. The two failures were `tracked / untracked / live counts reconcile` and `open_positions counts the untracked exposure too`, both of which hardcoded `1` tracked row — so they silently asserted *"the engine stayed flat for the whole run"*. The engine under test is **live against real market data with its own signal loop**, so it may legitimately open a paper trade mid-run; that is not the subject of the check and not something the engine guarantees. Reproduced deterministically by injecting a second `active_trades` row mid-run (identical `2/1/2` + `open_positions=3` signature), then fixed by deriving the expectations from the served rows and asserting the **partition invariant** — `tracked` = the symbols the served rows cover, `untracked` = published positions none of them covers, `open_positions = tracked ∪ live` — with the actual symbols printed in the failure detail. The injected case now passes (`rows ['TESTUSDT','ZZZUSDT']`) and so does a clean run: **48/48** both ways.
+
+### 2026-09-23 (6) — The roadmap CLI states each blocked pair's own threshold
+- **The CLI quoted one figure for the whole blocked set.** The recommendation read `Stay spot on: <every blocked pair> until ~$X equity`, where `X = max_floor × SL% / RISK%` — the *highest* floor in the group, applied to all of it. A `$5`-floor pair blocked on a `$22` account needs `$6`; on a watchlist that also held a `$100`-floor pair it was told to wait for `$120`. Each blocked pair now prints **its own** requirement (`floor × SL% / RISK%`) with the equity still to gain, and the list is sorted by floor so the cheapest to unlock reads first.
+- **The per-pair table gained a `req$` column** — the same figure for *every* row, not only the blocked ones, so the threshold governing each pair sits next to the floor it comes from. Against the live book: `BTCUSDT floor $50 → req$ 60`, while the four `$5`-floor pairs read `req$ 6`.
+- **New `S10` in `test_scenarios.py`** (6 checks): the CLI runs offline against a stubbed exchange; `B20USDT` quotes its own `$24` and **not** the group max `$120`; `C100USDT` quotes `$120`; both table rows carry their own `req$` and verdict; and the two blocked thresholds differ — which a single global figure could not do.
+- **Verification:** scenarios **46 checks** (was 40; S10: 6, S8: 13, S9: 8), sync **48/48**, UI **18/18**, smoke **13/13**, `tsc --noEmit` clean, `check:env` IN SYNC.
+
+### 2026-09-23 (5) — The blocked-pair chip states the computed threshold
+- **The chip printed a literal.** `StatusCards.tsx` rendered `{p} @ $24` as a JSX constant, not from the payload. It read correctly only while the watched set's highest floor happened to be `$20` (`20 × 0.012/0.01 = 24`); the moment the screener rotated in a pair with a different floor, the chip would state a wrong number **silently** — while the *stage* row directly above it, which does use the computed value, kept showing the truth. `compute_roadmap` now publishes **`required_equity`** on every pair — the equity at which proven sizing clears **that pair's own** NOTIONAL floor (`floor × SL% / RISK%`) — and the card renders it, so the two can no longer disagree.
+- **A payload without the field degrades honestly.** An engine predating this change publishes no `required_equity`; the chip then shows the symbol alone rather than resurrecting the baked-in number, so an un-upgraded engine can never print a figure that was right for a different watchlist.
+- **Verification:** two new checks in **E3** — every pair's `required_equity` equals `floor × sl_percent / risk_per_trade`, and a blocked pair's threshold exceeds the served proven notional (derived from the payload, so the check holds under any `RISK_PER_TRADE` / `SL_PERCENT`) — plus two new UI tests (a floor-50 pair renders `@ $60`, not `$24`; a payload without the field renders no threshold). Sync **48/48**, UI **18/18**; scenarios **ALL_OK**, smoke **13/13**, `tsc --noEmit` clean, `check:env` IN SYNC.
+
 ### 2026-09-23 (4) — The Capital Roadmap analyses the pairs the engine actually trades
 - **The roadmap described a different universe from the one being traded.** `capital_roadmap.DEFAULT_PAIRS` was a six-symbol literal (`NEAR/LINK/DOT/ARB/OP/LSK`) compiled into the module, while the engine runs `DYNAMIC_SYMBOLS=true` and the screener rotates `MAX_SYMBOLS` picks every cycle. The panel therefore reported floors for pairs the bot was not watching and omitted the ones it was — and it happened to be *right by luck* on the day, because the default list also contains one `$20`-floor pair. Both surfaces now take the **engine's live watched set** (`risk_state.monitored_symbols`, written by `trade_logic.update_symbols`: screener picks + `STATIC_SYMBOLS` + any symbol holding an open trade). `status.py` reads it once per payload via `_engine_watched_symbols(db_data)` — the same read that serves the `monitored_symbols` field, so the roadmap and that field cannot describe different universes — and passes it as `compute_roadmap(pairs=watch)`. The CLI defaults `--pairs` to the same DB row. `DEFAULT_PAIRS` survives only as the fallback for when the engine has published nothing, and the payload's new **`pairs_source`** (`engine-watchlist` | `default`) records which was used so the card never presents a fallback list as the live one.
 - **A rotated watchlist invalidates the cache.** The roadmap's exchange reads (per-symbol NOTIONAL floors, prices, funding) are reused for 10 minutes, but they belong to *specific* symbols — so `_ROADMAP_CACHE` is now keyed on the watched set and recomputed the moment it changes, rather than serving floors for pairs the engine has dropped (and omitting the ones it just picked up) for up to ten more minutes.
@@ -280,7 +525,11 @@ above the $5 floor with **no extra leverage**. The edge and the capital BOTH wor
 latest funding rate, reads equity from the engine DB (or `--equity`), and prints per-pair
 viability (floor vs proven notional, wallet %, liquidation distance at the configured leverage,
 funding), plus staged thresholds: **$6** lowest-floor pairs OK → **$24** ALL watched pairs OK →
-**$100** legacy assumption satisfied. Recommendation is pair-aware (LINK waits until ~$24).
+**$100** legacy assumption satisfied — all computed from the **live watched set** (`$6`/`$24` are
+the values for a `$5`/`$20` floor pair at the shipped `RISK_PER_TRADE`/`SL_PERCENT`). The served
+payload carries the same figure per pair as **`required_equity`**, so the dashboard's blocked-pair
+chips name each pair's own threshold instead of a constant baked into the card — and the CLI prints
+it too, as a `req$` column plus a per-pair blocked-pair recommendation.
 
 **Still required before flipping `MARKET=futures` live:** a 24h futures paper soak (`MARKET=futures
 PAPER_TRADE=true`, isolated DB) mirroring this math, then a futures-testnet session. `FUTURES_LEVERAGE=1`
@@ -1276,7 +1525,7 @@ safety, empty-state no-op).
 - **SQLite State Machine**: ACID-compliant persistence (`data/trading.db`) with **WAL mode**, a **dedicated read-only connection** for the monitor, and an **asynchronous batched write queue** that eliminates `database is locked` errors.
 - **Debian 13 & PEP 668 Native**: Runs inside an isolated Python virtual environment (`python3-venv`), never polluting system packages.
 - **PM2 Process Supervision**: `ecosystem.config.cjs` supervises **both** the engine (`main.py`) and the web monitor (`status.py --web 3000`) with auto-restart, a 2 GB memory cap, and rotating log files. (`.cjs` — the repo's root `package.json` sets `"type": "module"`, which would otherwise break `pm2 start` on CommonJS configs.)
-- **Unified Terminal & Web Monitor**: `status.py` serves an `htop`-style terminal dashboard **and** an embedded API (`/api/status`, `/api/logs`, `/api/health`, `/api/config`, `/api/control`) used by the interactive React web dashboard — **React frontend + WebSocket API + Python backend**, all from one port: `ws://<host>/ws` streams realtime status snapshots and incremental engine log lines (RFC 6455, stdlib-only server) with automatic HTTP polling fallback for proxies that block WebSocket upgrades.
+- **Unified Terminal & Web Monitor**: `status.py` serves an `htop`-style terminal dashboard **and** an embedded API (`/api/status`, `/api/logs`, `/api/health`, `/api/config`, `/api/control`) used  by the interactive React web dashboard — **React frontend + WebSocket API + Python backend**, all from one port: `ws://<host>/ws` streams realtime status snapshots (~1 s, coalesced) and incremental engine log records (RFC 6455, stdlib-only server) with automatic HTTP polling fallback for proxies that block WebSocket upgrades. The pusher only reaches sockets registered in `_ws_clients`, and every frame must be built from **bytes** (`_ws_encode_frame` concatenates onto a `bytearray`) — both were once wrong, which silently killed the whole channel (see the 2026-09-24 (9) changelog).
 - **Remote Operation**: The web dashboard can pause new entries, resume, liquidate all positions, close a single symbol, and push tuned `.env` parameters — no SSH required.
 - **Config Boot Validation**: `config.py` validates every tunable key at startup (ranges, non-negativity, integer minimums) so a typo in `.env` fails fast with a clear message instead of producing silent bad behavior.
 - **Feeds the Web Operations Center**: the engine persists live positions, orders, risk state, scanned candidates and balances to SQLite, and the React dashboard reads them over `status.py`'s API — the UI never fabricates server-side figures. Active positions are one joined view: the row's management state (stops, targets, trail, locks, size) plus the engine's own live mark, floating PnL and exchange size ([Active-position sync](#active-position-sync-engine--monitor)).
@@ -1911,9 +2160,39 @@ Then open `http://YOUR_VPS_IP:3000`. When a compiled `./dist` exists next to `st
 
 If no compiled `dist/` is found, `status.py --web` falls back to a built-in standalone dark-mode dashboard that includes a **Performance & Risk section** (win rate with W/L/B breakdown, profit factor, total realized PnL, average win/loss and the win/loss streak monitor) alongside the balance cards, market scanner, active positions and recent orders.
 
-> **Win-rate consistency**: wins, losses and breakevens are counted from **SELL exit orders that recorded a realized PnL** — never from BUY entries or un-filled orders — and the `win_rate` shown is `wins ÷ closed`. Partial-exit legs (recorded on `CANCELED` SELL orders) are included, so the numbers always reconcile with the engine's own streak and cooldown state.
+> **Win-rate consistency**: wins, losses and breakevens are counted per **TRADE**, from exit orders
+the engine labelled (or legacy rows with a non-zero realized PnL) — never from entries, and never
+from `side='SELL'`, which would miss a futures short whose closing order is a BUY. The `win_rate`
+shown is `wins ÷ closed`, and `closed` always equals `wins + losses + breakevens`. One scale-out is
+**one** trade classified by its **net** PnL (its partial and final legs are attributed to the same
+trade), the raw leg count is published separately as `exit_legs`, and the trade nets sum to
+`total_realized_pnl` — so the numbers reconcile with the engine's own streak and cooldown state.
+Counting legs inflated the denominator: a trade that banked +1R and then stopped out on the runner
+was reported as one win **and** one loss.
 
 > **Candle subscription note**: the WebSocket market stream subscribes to each monitored symbol's `aggTrade` + `kline_<TIMEFRAME>` streams. Binance public streams are free and do not require an API key, but each connection is limited to 500 streams — the bot bounds symbol lists to that cap.
+
+### Exit attribution (engine → monitor)
+
+The Recent Completed Trades table used to state three things that were not true, because the monitor
+was guessing at what the engine already knew. Both halves are now explicit:
+
+| Rendered as | Source of truth |
+|---|---|
+| **Exit Reason** badge | `orders.exit_reason` — the `reason` `trade_policy.evaluate_exit` returned, written by `close_trade` on **every** exit leg (`STOP_LOSS` / `TRAILING_STOP` / `TAKE_PROFIT` / `TIME_STOP` / `EOD_CLOSE`) |
+| Rows written before that column existed | Still inferred from the realized PnL sign, but served with **`exit_reason_inferred: true`** and marked in the UI; a legacy partial leg keeps a **null** reason and renders `PARTIAL_EXIT` rather than being handed an invented trigger |
+| **Entry → Exit** prices | `entry_ts` / `entry_price` from the **opposite** side's latest FILLED order at or before the exit (a long's entry is its last BUY, a short's its last SELL) |
+| **Total closed** in the header | `stats.closed_trades` — the engine's full history, with `stats.exit_legs` in the tooltip (falling back to the served window only when the engine publishes no stats) |
+| Row order | Sorted by exit time in the component itself, newest first — the server *happens* to send newest-first, and relying on that is what made the table print its **oldest** rows under a "newest first" subtitle |
+
+Why it mattered, measured against the engine's own log for the same 12 exits: the engine logged
+**17 × `STOP_LOSS`**, the dashboard served **8 × `TAKE_PROFIT`** — including a position that closed at
+**+0.21** on a protective stop the engine called `STOP_LOSS`. The amber `TRAILING_STOP` badge was
+unreachable code, and a `TAKE_PROFIT` badge did not mean the target was hit. The schema change is
+the engine's: `db_manager.init_db()` adds `orders.exit_reason` idempotently (the monitor opens the
+same file read-only and adapts to a pre-migration file rather than migrating it), and
+`_send_daily_report` now uses the **same** exit predicate and per-trade attribution as the monitor, so
+the Discord report and the dashboard cannot disagree about the same day's book.
 
 ### Active-position sync (engine → monitor)
 
@@ -1971,10 +2250,11 @@ comes from the engine's own `risk_state.total_equity`; floors, prices and fundin
 |---|---|
 | Pair list | The **engine's live watched set** — `risk_state.monitored_symbols` (screener picks + `STATIC_SYMBOLS` + any symbol holding an open trade). `DEFAULT_PAIRS` applies only when the engine has published none |
 | `pairs_source` | `engine-watchlist` or `default` — which of the two was used, so the card can say so |
+| `required_equity` (per pair) | Equity at which proven sizing clears **that pair's** own floor (`floor × SL% / RISK%`). The blocked-pair chips render this, so a threshold stays correct when the screener rotates in a higher-floor pair instead of being assumed from the watchlist of the day |
 | Cache | 10 minutes, **invalidated immediately when the watched set changes** (the floors are per-symbol) |
 | `age_s` | How old this snapshot is; the card labels the cell *Equity (at compute)* |
 | Stages | Equity thresholds where futures constraints stop binding — computed over the **watched** pairs, so they track the universe being traded |
-| CLI | `./venv/bin/python3 capital_roadmap.py [--equity N] [--pairs A,B]` — defaults to the same DB watchlist |
+| CLI | `./venv/bin/python3 capital_roadmap.py [--equity N] [--pairs A,B]` — defaults to the same DB watchlist. Per-pair table carries a **`req$`** column (that pair's own floor-clearing equity), and the blocked-pair recommendation quotes each pair's own threshold rather than one max-floor figure |
 
 The roadmap is monitor-computed, not engine-published (see the liveness table above): the engine
 writes the watchlist, the monitor does the exchange maths on top of it.
@@ -1984,7 +2264,7 @@ writes the watchlist, the monitor does the exchange maths on top of it.
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/api/status` | GET | Full snapshot: engine process state, SQLite trades/orders/risk/stats, live balance, scanned candidates, sanitized config, pause state |
-| `/api/logs?lines=120` | GET | Tail `logs/trading.log` for the web Debug Console |
+| `/api/logs?lines=120` | GET | Last **complete** records of `logs/trading.log` for the web Engine Log tab. `lines` is clamped server-side to `1..500` (default 120, non-numeric → default) and a half-written final record is never served truncated (it is carried and delivered once its newline lands) |
 | `/api/health` | GET | Lightweight liveness probe |
 | `/api/config` | GET / POST | Read sanitized config / apply a whitelisted `.env` payload |
 | `/api/control` | POST | `{"action": "pause" \| "resume" \| "close_all" \| "close_symbol", "symbol": "…"}` |
@@ -2064,7 +2344,29 @@ re-write (no per-cycle churn), a ratcheted trail / a breakeven lock / a size cha
 immediately, the heartbeat refreshes an unchanged row, a DB failure is swallowed and retried, and an
 older partial row shape is tolerated.
 
-Exit code 0 = `ALL_OK` (40 checks), 1 = at least one failure, which is named.
+**S10 guards the roadmap CLI's per-pair arithmetic** — the recommendation used to quote one `max_floor × SL% / RISK%` for the entire blocked set, so a `$20`-floor pair needing `$24` was told to wait for `$120` whenever a `$100`-floor pair was also blocked. The checks run the CLI offline against a stubbed exchange and pin that each blocked pair quotes its **own** threshold, that the two differ, and that the per-pair `req$` column agrees with the recommendation line.
+
+**S11 guards the exit attribution the dashboard renders** — the label, the count and the identity of
+an exit. The battery builds synthetic order histories and pins that an exit's reason is the
+**engine's own** (`orders.exit_reason`, already exercised end-to-end by `sync_test.py` **D2**), that a
+legacy row with no stored reason is served **flagged** as inferred, that a legacy partial leg gets no
+invented trigger, that a scale-out's two legs are **one trade** classified by its **net** PnL, that
+trade nets always sum to `total_realized_pnl`, that a short's **BUY** closing order is a closed trade
+whose entry comes from the opposite (**SELL**) leg, that streaks are served as numbers, and that the
+stats query degrades to a leg-based aggregate (never raises) on a SQLite without window functions.
+
+**S13 guards the soak surface** — the futures-soak card and the watchdog's Discord summaries, against
+a synthetic futures book containing a scale-out long and a **short**: both readers must report 2
+trades (not legs), `W 2 / L 0`, the same net PnL, and agree with each other. It also pins the two
+fields that were reading the wrong thing — "last trade" must be the newest **exit**, not the newest
+order write (`updated_at` moves on an entry fill), and the soak's length must come from the **live
+config** while the module default stays untouched (`SOAK_HOURS=6` ⇒ a 6h deadline, not 24h) — plus
+the watchdog's `loss_streak` (the engine does not persist `lose_streak`) and its derived starting
+balance (`paper_start_balance` is not written either). **S14** guards the browser check's roadmap
+re-read: a rotated watchlist must trigger a re-read, not a false `missing: [...]` failure, while a
+genuine threshold disagreement is still detected.
+
+Exit code 0 = `ALL_OK` (108 checks), 1 = at least one failure, which is named.
 
 ### Config Drift Check (`check_env_drift.py`)
 
@@ -2095,7 +2397,7 @@ npm run check:env -- --update            # same thing, via npm
 
 `--update` rewrites changed values, appends keys the live config has and the template lacks, and comments out keys `.env` no longer sets. It **never** copies a credential: the exempt keys keep their placeholders, and any key whose name looks sensitive is skipped rather than written into a tracked file. Output redacts sensitive-looking values and drops ANSI colour when piped, so it is safe to gate a commit or a deploy on.
 
-With no `.env` present (a fresh clone, or CI without secrets) it prints `SKIP` and exits 0 — it never fails merely because secrets are absent. `npm run verify` runs this check together with the rest of the battery (`lint` → `check:env` → `smoke` → `test:ui` → `test:sync`).
+With no `.env` present (a fresh clone, or CI without secrets) it prints `SKIP` and exits 0 — it never fails merely because secrets are absent. `npm run verify` runs this check together with the rest of the battery (`lint` → `check:env` → `smoke` → `test:ui` → `test:sync` → `test:scenarios` → `test:browser`).
 
 **Install it as a pre-commit hook** so drift cannot be committed at all:
 
@@ -2106,24 +2408,53 @@ npm run hooks:install          # or: bash scripts/install-hooks.sh
 
 The hook lives versioned at `.githooks/pre-commit` — git only executes `.git/hooks/`, which is never committed — so the installer symlinks it into place. It is idempotent (re-running is harmless) and moves any pre-existing hook aside to a timestamped backup rather than clobbering it. After that, a drifted commit is refused with the exact `--update` command printed, plus the deliberate `git commit --no-verify` escape hatch. If no Python interpreter is found the hook warns and lets the commit through instead of blocking all work. Teams can skip the installer entirely and point git at the directory: `git config core.hooksPath .githooks`.
 
+### Browser Render Check (`browser_smoke.py`)
+
+Every other suite stops one step short of a browser: `smoke_test.py` proves the engine boots, `sync_test.py` proves the payload matches the engine, and `scripts/ui_smoke.mjs` renders the React tree to **static markup**. None of them runs Blink, so none can catch a defect that only exists once the page is laid out — a bundle that 404s after a deploy, a card inside a `display:none` container, a value that renders a constant instead of the served one, or a component that throws while the page is live.
+
+`browser_smoke.py` closes that gap. It discovers a Chromium, launches it headless, and drives it over the **Chrome DevTools Protocol** directly — no Playwright or Puppeteer dependency, and it downloads nothing. It loads the running monitor and asserts against the DOM **and** against the same `/api/status` payload the page itself fetched.
+
+That last part is the point: every rendered figure is compared to **its source**, never to a constant copied into the test. The chip check reads the payload's `roadmap.pairs[].required_equity` and the card's rendered chips, and requires them to agree — so a chip that went back to printing a literal `$24` fails, even on a day when `$24` happens to be right for some other pair.
+
+15 assertions against the live page:
+
+| Group | Assertions |
+|---|---|
+| Page | `readyState=complete`; body text > 2000 chars (not a blank shell); all 5 desk sections; the 5-tab nav; no `NaN` / `undefined` / `Infinity` / `[object Object]` canaries in the DOM; no uncaught JS exception; every request succeeded — a bare `/favicon.ico` 404 is noted, never failed on |
+| Capital Roadmap card | laid out and visible (non-zero rect, not `display:none`, `visibility:visible`, `opacity>0`); names the universe **the server reported** (same count, `engine-watched` vs `fallback`) rather than assuming one; states its snapshot age; every viable pair renders a chip; every blocked pair's chip carries the **served** threshold; and **no rendered threshold contradicts the served value** |
+
+```bash
+cd /path/to/ultimate-bot
+./venv/bin/python3 browser_smoke.py                        # exit 0 = BROWSER_OK
+./venv/bin/python3 browser_smoke.py --url http://HOST:3000/
+./venv/bin/python3 browser_smoke.py --chrome /usr/bin/chromium --strict
+# or from the repo root:
+npm run test:browser
+```
+
+Chromium is discovered from `--chrome`, then `$CHROME_BIN` / `$CHROMIUM_BIN` / `$GOOGLE_CHROME_BIN`, then `PATH` (`google-chrome`, `chromium`, `chrome`, …), then the Playwright cache (`~/.cache/ms-playwright`) and the Puppeteer cache (`~/.cache/puppeteer`) — newest versioned directory first.
+
+It is an **integration** check: it needs a running monitor *and* a browser. When either is missing it prints `SKIP` and exits 0 — the same convention as `check_env_drift.py` with no `.env` — so `npm run verify` stays green on a machine that has neither. **`--strict`** turns those skips into failures on a host that is supposed to have both (a VPS running the monitor, or CI that provisions one). It is read-only: it loads the page, reads the DOM, and places no orders.
+
 ### Sync Integration Test (`sync_test.py`)
 
-`sync_test.py` verifies the **engine ↔ web monitor data chain** end-to-end (46 checks). It boots the real engine in paper mode against an isolated temp database plus `status.py --web`, then asserts:
+`sync_test.py` verifies the **engine ↔ web monitor data chain** end-to-end (61 checks). It boots the real engine in paper mode against an isolated temp database plus `status.py --web`, then asserts:
 
 1. **Equity sync** — `paper_balance` risk state surfaces through `/api/status`.
 2. **Remote-control sync** — `paused`/`resume` written to `CONTROL_FILE` reflect in `/api/status.control`; **B1** additionally proves the engine's loop heartbeat carries a fresh age and *acknowledges* the pause (`paused_applied`) before clearing it on resume — request ≠ applied, verified end-to-end.
 3. **Realtime transport sync** — engine-published `ws_streams` health and balance provenance, and the *same* fields over the `/ws` push, so HTTP and WebSocket can never disagree.
 4. **Streak aggregation** — per-symbol `risk_<SYM>` blobs aggregate to top-level `win_streak` / `loss_streak` / `cooldown_until` (and appear in `stats`).
-5. **Trade-stats sync** — an injected closed SELL exit updates `closed_trades` / `winning_trades` / `total_realized_pnl`; `closed == W + L + B` reconciles.
-6. **Active-trade sync** — an injected `active_trades` row appears with entry/stop/TP intact (**E**), and an injected `futures_state` snapshot proves the served row carries the **engine's** mark (`mark = entry + uPnL/amount`), floating PnL, exchange size and provenance, with an untracked exchange position counted but never double-counted — plus per-position `leverage` / `margin_type` normalised from the snapshot's top level and a derived `mark_price` (**E2**).
+5. **Trade-stats sync** — an injected closed exit updates `closed_trades` / `winning_trades` / `total_realized_pnl`; `closed == W + L + B` reconciles.
+5b. **Exit attribution** (**D2**) — the boot migration really added `orders.exit_reason`; the engine's own reason reaches `/api/status` verbatim and a legacy row is flagged `inferred`; a scale-out's extra legs do **not** become extra trades (asserted as a delta, since the engine may trade mid-run); a short's **BUY** closing order is served as a closed trade with its entry price taken from the SELL leg; an entry order is not served as an exit; streaks arrive as numbers; and the served realized total matches a sum this test computes itself from the exit predicate.
+6. **Active-trade sync** — an injected `active_trades` row appears with entry/stop/TP intact (**E**), and an injected `futures_state` snapshot proves the served row carries the **engine's** mark (`mark = entry + uPnL/amount`), floating PnL, exchange size and provenance, with an untracked exchange position counted but never double-counted — plus per-position `leverage` / `margin_type` normalised from the snapshot's top level and a derived `mark_price` (**E2**). The count assertions are the **partition invariant** (`tracked` = symbols the served rows cover, `untracked` = published positions none of them covers, `open_positions = tracked ∪ live`) derived from the payload, not hardcoded numbers — the engine may open its own paper trade mid-run, and a frozen count made these flaky.
 7. **Config sanitization** — `/api/status.config` never contains credentials.
 8. **Config live-refresh** — an out-of-band `.env` edit is served without restarting the monitor.
-9. **Roadmap watchlist** — the served `roadmap.pairs` equals the served `monitored_symbols`, `pairs_source` names the list it used, ok/blocked partition the watched set against the served proven notional, and a rotated watchlist invalidates the cache (**E3**; exchange data stubbed and the payload built from a private DB copy, so no network and no interference with the serving monitor).
+9. **Roadmap watchlist** — the served `roadmap.pairs` equals the served `monitored_symbols`, `pairs_source` names the list it used, ok/blocked partition the watched set against the served proven notional, every pair publishes its own floor-clearing threshold (`required_equity == floor × SL% / RISK%`, and a blocked pair's exceeds the proven notional), and a rotated watchlist invalidates the cache (**E3**; exchange data stubbed and the payload built from a private DB copy, so no network and no interference with the serving monitor).
 10. **Clean shutdown** after all writes (exit 0, `Shutdown complete.`, lock released).
 
 ```bash
 cd /path/to/ultimate-bot
-./venv/bin/python3 sync_test.py     # exit 0 = all 46 checks passed
+./venv/bin/python3 sync_test.py     # exit 0 = all 61 checks passed
 # or from the repo root:
 npm run test:sync
 ```

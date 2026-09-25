@@ -46,6 +46,8 @@ interface LiveDashboardProps {
   cooldownEndsAt: number;
   cooldownKind: string;
   engineRisk: EngineRiskState | null;
+  /** The engine's OWN process state (payload `process`), not a freshness guess. */
+  engineRunning: boolean;
   vpsConnected: boolean;
   vpsBalance: VpsBalanceData | null;
   onPushConfigToVps: () => Promise<PushResult>;
@@ -60,6 +62,11 @@ interface LiveDashboardProps {
     win_rate?: number;
     profit_factor?: number | null;
     total_realized_pnl?: number;
+    /** Exit ORDERS behind `closed_trades` — one trade can have several legs. */
+    exit_legs?: number;
+    /** Numeric since the monitor stopped serving the raw risk_state strings. */
+    win_streak?: number;
+    loss_streak?: number;
   } | null;
   wsStreams: WsStreams | null;
   loopState: LoopState | null;
@@ -163,6 +170,7 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   cooldownEndsAt,
   cooldownKind,
   engineRisk,
+  engineRunning,
   vpsConnected,
   vpsBalance,
   onPushConfigToVps,
@@ -198,6 +206,22 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
   // SQLite history) over the locally-mapped window of recent orders, so win rate,
   // profit factor and win/loss counts always match the engine exactly.
   const useServerStats = !!serverStats && (serverStats.closed_trades ?? 0) > 0;
+  // "Total closed" is a TRADE count, not the length of the windowed order list
+  // this table renders (25 orders ≈ a dozen exits). When the engine publishes
+  // its full-history stats they are authoritative; the window is the fallback.
+  const totalClosed = useServerStats ? (serverStats!.closed_trades ?? 0) : closedTrades.length;
+  // Streaks: the engine's live in-memory snapshot wins; without one (older
+  // engine, or before its first publish) use the served numeric counts rather
+  // than rendering 0 — the served value used to be a raw risk_state string.
+  const shownWinStreak = engineRisk ? winStreak : (serverStats?.win_streak ?? winStreak);
+  const shownLossStreak = engineRisk ? lossStreak : (serverStats?.loss_streak ?? lossStreak);
+  // The closed-trades table shows the NEWEST exits first. The server happens to
+  // send newest-first, but relying on that silently printed the OLDEST eight
+  // (`slice(-8)` on a descending array) and reversed them, so the freshest exits
+  // never appeared. Sort here so the table is correct whatever order it receives.
+  const recentClosedTrades = [...closedTrades]
+    .sort((a, b) => b.exitTime - a.exitTime)
+    .slice(0, 8);
 
   const winningTrades = closedTrades.filter(t => t.pnl > 0);
   const losingTrades = closedTrades.filter(t => t.pnl < 0);
@@ -246,6 +270,13 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
     ? Math.max(0, (Date.now() - Math.max(...symbolsData.map(s => s.signal?.time ?? 0))) / 1000)
     : null;
   const loopAgeS = loopState?.age_s ?? fallbackSignalAgeS;
+  // The engine publishes its OWN loop cadence in the heartbeat; the client config
+  // is only the fallback. Showing the config while the engine ran a different
+  // SIGNAL_INTERVAL is how this row could state a cadence the engine never kept.
+  const engineIntervalFromHeartbeat = (loopState?.interval_s ?? 0) > 0;
+  const engineIntervalS = engineIntervalFromHeartbeat
+    ? (loopState?.interval_s as number)
+    : config.signalInterval;
   // null = the engine published no heartbeat: show the request as applied rather
   // than inventing a pending state for an older build.
   const pauseApplied = loopState ? loopState.paused_applied : null;
@@ -397,8 +428,8 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
             <span className="text-xs text-slate-400">PF: <strong className="num text-slate-200">{profitFactor}</strong></span>
           </div>
           <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
-            <span>Win <b className="num text-emerald-400">{winStreak}</b>/{config.maxWinStreak}</span>
-            <span>Loss <b className="num text-rose-400">{lossStreak}</b>/{config.maxLossStreak}</span>
+            <span>Win <b className="num text-emerald-400">{shownWinStreak}</b>/{config.maxWinStreak}</span>
+            <span>Loss <b className="num text-rose-400">{shownLossStreak}</b>/{config.maxLossStreak}</span>
           </div>
           <div className="mt-2 flex items-center justify-between border-t border-slate-700/50 pt-2 text-[11px] text-slate-400">
             {useServerStats ? (
@@ -464,11 +495,12 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
       <EngineHealthCard
         streams={wsStreams}
         connected={vpsConnected}
-        engineRunning={vpsConnected && (wsStreams?.engine_age_s == null || wsStreams.engine_age_s <= 30)}
+        engineRunning={engineRunning}
         controlPaused={controlPaused}
         engineRisk={engineRisk}
         breakerTripped={breakerTripped}
-        scanInterval={config.signalInterval}
+        scanInterval={engineIntervalS}
+        intervalFromEngine={engineIntervalFromHeartbeat}
         loopAgeS={loopAgeS}
         loopFromHeartbeat={loopState?.age_s != null}
         pauseApplied={pauseApplied}
@@ -749,7 +781,19 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
         icon={<History className="h-4 w-4 text-slate-400" />}
         title="Recent Completed Trades"
         subtitle="exits with realized PnL, newest first"
-        meta={<Chip label="Total closed" value={closedTrades.length} />}
+        meta={
+          <Chip
+            label={useServerStats ? 'Total closed (all-time)' : 'Total closed (window)'}
+            value={totalClosed}
+            title={
+              useServerStats
+                ? `The engine's full-history trade count (one trade may span several exit legs${
+                    serverStats?.exit_legs != null ? `; ${serverStats.exit_legs} legs` : ''
+                  }); this table shows the 8 most recent.`
+                : `Only the exits inside the served order window (${closedTrades.length}) — the engine has published no history stats.`
+            }
+          />
+        }
         bodyClass=""
       >
         {closedTrades.length === 0 ? (
@@ -771,7 +815,7 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-700/50">
-                {closedTrades.slice(-8).reverse().map((trade, idx) => (
+                {recentClosedTrades.map((trade, idx) => (
                   <tr key={`closed_trade_${trade.id || trade.symbol}_${trade.exitTime || idx}`} className="hover:bg-slate-700/20">
                     <td className="py-2.5 px-4 font-bold text-slate-200">{trade.symbol}</td>
                     <td className="py-2.5 px-4">
@@ -784,14 +828,25 @@ export const LiveDashboard: React.FC<LiveDashboardProps> = ({
                       <ExitedCell trade={trade} />
                     </td>
                     <td className="py-2.5 px-4">
-                      <span className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
-                        trade.exitReason === 'TAKE_PROFIT'
-                          ? 'border border-emerald-500/30 bg-emerald-500/20 text-emerald-300'
-                          : trade.exitReason === 'TRAILING_STOP'
-                          ? 'border border-amber-500/30 bg-amber-500/20 text-amber-300'
-                          : 'border border-rose-500/30 bg-rose-500/20 text-rose-300'
-                      }`}>
+                      {/* The engine writes its OWN reason (stop / target / trail /
+                          time stop / day-end) on the exit order. Rows predating
+                          that column are still inferred from the PnL sign and are
+                          marked: a TAKE PROFIT badge must never appear on an exit
+                          whose target was not actually reached. */}
+                      <span
+                        className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
+                          trade.exitReason === 'TAKE_PROFIT'
+                            ? 'border border-emerald-500/30 bg-emerald-500/20 text-emerald-300'
+                            : trade.exitReason === 'TRAILING_STOP'
+                            ? 'border border-amber-500/30 bg-amber-500/20 text-amber-300'
+                            : 'border border-rose-500/30 bg-rose-500/20 text-rose-300'
+                        }`}
+                        title={trade.exitReasonInferred
+                          ? 'Inferred from the realized PnL sign — this row predates the engine recording its own exit reason, so treat the label as a guess.'
+                          : "The engine's own exit reason (trade_policy.evaluate_exit)."}
+                      >
                         {trade.exitReason.replace(/_/g, ' ')}
+                        {trade.exitReasonInferred && <span className="ml-1 opacity-70">~</span>}
                       </span>
                     </td>
                     <td className="num py-2.5 px-4 text-right font-bold">

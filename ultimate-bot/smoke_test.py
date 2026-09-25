@@ -38,6 +38,9 @@ import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+import trade_stats  # noqa: E402  (one definition of "an exit", see module)
 VENV_PY = os.path.join(ROOT, "venv", "bin", "python3")
 PYTHON = VENV_PY if os.path.exists(VENV_PY) else sys.executable
 
@@ -257,14 +260,23 @@ def main():
             # comparing its stats to a direct SQL query of the temp database.
             db = os.path.join(tmp, "trading.db")
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3)
+            conn.row_factory = sqlite3.Row  # named columns, as the monitor reads it
             try:
+                # Counted with the SAME definition the monitor serves (the shared
+                # trade_stats attribution), so this check isolates the wiring it
+                # is about — DID the monitor read this temp DB — instead of
+                # re-asserting the definition with a `side='SELL'` query that
+                # would disagree the first time a futures short closes.
                 row = conn.execute(
-                    "SELECT COUNT(*), "
-                    "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 THEN 1 ELSE 0 END), "
-                    "SUM(CASE WHEN side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss < 0 THEN 1 ELSE 0 END) "
-                    "FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL"
+                    trade_stats.trades_totals_sql(
+                        trade_stats.exit_predicate(
+                            trade_stats.has_exit_reason(conn)
+                        )
+                    )
                 ).fetchone()
-                db_closed, db_wins, db_losses = (int(x or 0) for x in row)
+                db_closed = int(row["closed"] or 0)
+                db_wins = int(row["wins"] or 0)
+                db_losses = int(row["losses"] or 0)
             finally:
                 conn.close()
             api_closed = int(stats.get("closed_trades") or 0)

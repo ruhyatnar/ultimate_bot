@@ -156,6 +156,13 @@ export interface ClosedTrade {
     | 'REMOTE_CLOSE_ALL'
     | 'PARTIAL_EXIT'
     | 'MARKET_EXIT';
+  /**
+   * True when the engine never recorded a reason for this row (it predates the
+   * exit_reason column) and the label was INFERRED from the PnL sign. The UI
+   * marks those, because an inferred 'TAKE_PROFIT' means "profitable exit", not
+   * "the target was reached". Absent on rows the engine labelled itself.
+   */
+  exitReasonInferred?: boolean;
 }
 
 export interface LogMessage {
@@ -353,6 +360,13 @@ export interface RoadmapPair {
   price?: number | null;
   floor: number;
   ok: boolean;
+  /**
+   * Equity at which proven sizing clears this pair's own NOTIONAL floor
+   * (`floor * sl_percent / risk_per_trade`), computed server-side per pair —
+   * so a blocked chip never inherits a threshold that only held for a
+   * different watchlist.
+   */
+  required_equity?: number | null;
   funding_rate?: number | null;
 }
 

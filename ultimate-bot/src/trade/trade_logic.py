@@ -1366,7 +1366,12 @@ class TradeLogic:
 
         # Partial exit = the order was canceled after a partial fill; full exit = FILLED.
         exit_status = "CANCELED" if (is_partial and remaining_qty > 0) else "FILLED"
-        await self.db.update_order_status(exit_order_id, exit_status, executed_qty, fill_price, profit_loss=pnl)
+        # Record the engine's own exit reason on the order. It is the `reason`
+        # evaluate_exit returned (STOP_LOSS / TRAILING_STOP / TAKE_PROFIT /
+        # TIME_STOP / EOD_CLOSE), written on every exit leg, so the dashboard can
+        # label an exit for what it WAS rather than inferring it from the PnL sign.
+        await self.db.update_order_status(exit_order_id, exit_status, executed_qty, fill_price,
+                                          profit_loss=pnl, exit_reason=reason)
         if is_partial and remaining_qty > 0:
             trade["quantity"] = remaining_qty
             self.active_trades[symbol] = trade
@@ -1723,16 +1728,77 @@ class TradeLogic:
             await asyncio.sleep((target - now).total_seconds())
             await self._send_daily_report()
 
+    async def _daily_closed_stats(self, day):
+        """(trades, total_pnl, wins) for one UTC day.
+
+        Deliberately the SAME definition the web monitor's stats use, because this
+        report is the operator's second view of the same book:
+
+          * an exit is a row the engine labelled (`exit_reason`, written by
+            close_trade) or a legacy row with a non-zero realized PnL — never
+            `side='SELL'`, which silently drops any exit that is not a spot-style
+            SELL (a futures short is closed with a BUY);
+          * a TRADE is not a leg: scale-out writes a partial leg plus a final leg,
+            and counting legs reported one trade as both a win and a loss.
+
+        Returns counts or None when neither query can run, so a stats hiccup can
+        never stop the daily report from being sent.
+        """
+        exit_pred = (
+            "(exit_reason IS NOT NULL"
+            " OR (profit_loss IS NOT NULL AND profit_loss != 0))"
+        )
+        trade_sql = (
+            "WITH exits AS ("
+            "  SELECT id, symbol, status, profit_loss, created_at FROM orders"
+            f"  WHERE {exit_pred} AND date(created_at/1000, 'unixepoch') = ?"
+            "), legs AS ("
+            "  SELECT symbol, created_at, profit_loss,"
+            "         MIN(CASE WHEN status = 'FILLED' THEN created_at END) OVER ("
+            "           PARTITION BY symbol ORDER BY created_at, id"
+            "           ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"
+            "         ) AS trade_key FROM exits"
+            "), trades AS ("
+            # A leg with no FILLED exit after it belongs to a still-open position
+            # (a scale-out partial): its own timestamp makes it its own trade, so
+            # the trade nets always add up to the realized total.
+            "  SELECT symbol, COALESCE(trade_key, created_at) AS trade_key,"
+            "         SUM(profit_loss) AS pnl FROM legs"
+            "  GROUP BY symbol, COALESCE(trade_key, created_at)"
+            ")"
+            " SELECT COUNT(*), COALESCE(SUM(pnl), 0),"
+            "  COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) FROM trades"
+        )
+        try:
+            row = await self.db.fetch_one(trade_sql, (day,))
+            if row:
+                return (
+                    int(row[0] or 0),
+                    float(row[1] or 0.0),
+                    int(row[2] or 0),
+                )
+        except Exception as exc:  # noqa: BLE001 - degraded stats must not stop the report
+            # Window functions need SQLite >= 3.25; fall back to the legacy
+            # leg-based aggregate rather than losing the report.
+            self.logger.warning(f"Daily trade attribution failed ({exc}); using leg counts")
+        try:
+            row = await self.db.fetch_one(
+                f"SELECT COUNT(*), COALESCE(SUM(profit_loss), 0), "
+                f"COALESCE(SUM(CASE WHEN profit_loss > 0 THEN 1 ELSE 0 END), 0) "
+                f"FROM orders WHERE {exit_pred} "
+                "AND date(created_at/1000, 'unixepoch') = ?",
+                (day,),
+            )
+            if row:
+                return (int(row[0] or 0), float(row[1] or 0.0), int(row[2] or 0))
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(f"Daily stats unavailable: {exc}")
+        return None
+
     async def _send_daily_report(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        # "Closed trades" uses the same definition as the web monitor stats: SELL exit
-        # orders that recorded a realized PnL, including partial-exit legs (CANCELED
-        # SELL orders with profit_loss set). BUY entries are never counted.
-        row = await self.db.fetch_one("SELECT COUNT(*), SUM(profit_loss) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss IS NOT NULL AND date(created_at/1000, 'unixepoch') = ?", (today,))
-        total_trades = row[0] if row else 0
-        total_pnl = row[1] if row and row[1] is not None else 0.0
-        row = await self.db.fetch_one("SELECT COUNT(*) FROM orders WHERE side='SELL' AND status IN ('FILLED','CANCELED') AND profit_loss > 0 AND date(created_at/1000, 'unixepoch') = ?", (today,))
-        wins = row[0] if row else 0
+        daily = await self._daily_closed_stats(today)
+        total_trades, total_pnl, wins = daily if daily else (0, 0.0, 0)
         win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
         embed = {
             "title": "Daily Trading Report",

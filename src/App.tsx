@@ -21,6 +21,7 @@ import {
 } from './types';
 import { generateEnvString } from './utils/envGenerator';
 import { VpsSocket, WsTransport } from './utils/vpsSocket';
+import { EngineLogSink, createEngineLogSink } from './utils/engineLog';
 import { Header } from './components/Header';
 import { VpsConnectionBar } from './components/VpsConnectionBar';
 import { LiveDashboard } from './components/LiveDashboard';
@@ -290,11 +291,13 @@ export default function App() {
     level: LogMessage['level'],
     category: LogMessage['category'],
     message: string,
-    symbol?: string
+    symbol?: string,
+    /** Engine clock for the line (`HH:MM:SS`); defaults to the browser's now. */
+    timestamp?: string
   ) => {
     const newLog: LogMessage = {
       id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
-      timestamp: new Date().toISOString().substring(11, 19),
+      timestamp: timestamp || new Date().toISOString().substring(11, 19),
       level,
       category,
       message,
@@ -302,6 +305,39 @@ export default function App() {
     };
     setLogs(prev => [...prev.slice(-300), newLog]);
   }, []);
+
+  /** Attach an unstructured line (e.g. a traceback frame) to the last record,
+   *  so an ERROR's stack is readable instead of silently dropped. */
+  const appendLogText = useCallback((text: string) => {
+    setLogs(prev => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      return [...prev.slice(0, -1), { ...last, message: `${last.message}\n${text}` }];
+    });
+  }, []);
+
+  // One log sink for the whole app: the /ws incremental push and the HTTP
+  // fallback both feed it, so a line can never be shown twice (or be shown with
+  // the browser's arrival time instead of the engine's own clock).
+  const engineLogSinkRef = useRef<EngineLogSink | null>(null);
+  if (!engineLogSinkRef.current) engineLogSinkRef.current = createEngineLogSink();
+  const ingestEngineLogLines = useCallback(
+    (lines: string[]) => {
+      const frames = engineLogSinkRef.current?.push(lines) ?? [];
+      for (const frame of frames) {
+        if (frame.kind === 'line') {
+          addLog(frame.record.level, 'SYS', frame.record.message, undefined, frame.record.timestamp);
+        } else {
+          appendLogText(frame.text);
+        }
+      }
+    },
+    [addLog, appendLogText]
+  );
+  // The socket is built once and kept for the session, so it reaches the
+  // current ingester through a ref (same pattern as applyVpsPayloadRef).
+  const ingestEngineLogLinesRef = useRef(ingestEngineLogLines);
+  ingestEngineLogLinesRef.current = ingestEngineLogLines;
 
   // Persist config + VPS settings to localStorage
   useEffect(() => {
@@ -322,26 +358,12 @@ export default function App() {
   const lastWsTransportRef = useRef<WsTransport>('connecting');
   const vpsSocketRef = useRef<VpsSocket | null>(null);
   if (typeof window !== 'undefined' && !vpsSocketRef.current) {
-    const seenWsLogs = new Set<string>();
     vpsSocketRef.current = new VpsSocket({
       onSnapshot: (payload) => applyVpsPayloadRef.current(payload),
       onLogLines: (lines) => {
-        // Same line-format mapping as the HTTP log poller; WS pushes only new
-        // lines, but a rotated/truncated log resends its tail — dedupe on it.
-        const lineRegex = /^(.+?) - (INFO|WARNING|ERROR|DEBUG|CRITICAL) - (.*)$/;
-        lines.forEach(raw => {
-          const match = lineRegex.exec(raw.trim());
-          if (!match) return;
-          const [, , level, message] = match;
-          if (!message.trim()) return;
-          const id = `${level}_${message.slice(0, 80)}`;
-          if (seenWsLogs.has(id)) return;
-          seenWsLogs.add(id);
-          if (seenWsLogs.size > 4000) seenWsLogs.clear();
-          const mappedLevel: LogMessage['level'] =
-            level === 'WARNING' ? 'WARN' : level === 'CRITICAL' ? 'ERROR' : (level as LogMessage['level']);
-          addLog(mappedLevel, 'SYS', message.trim());
-        });
+        // Same parser + deduper as the HTTP poller (utils/engineLog): WS pushes
+        // only new lines, but a rotated/truncated log resends its tail.
+        ingestEngineLogLinesRef.current(lines);
       },
       onStatus: (update) => {
         setWsTransport(update.transport);
@@ -689,21 +711,23 @@ export default function App() {
         setActiveTrades(mappedActive);
       }
 
-      // ---- closed trades: only SELL exits that recorded a realized PnL ----
-      // The raw orders list also contains BUY entries (profit_loss=0), NEW orders
-      // and CANCELED attempts; including those would dilute the win-rate
-      // denominator. Partial-exit legs persist as CANCELED SELL with non-zero PnL.
+      // ---- closed trades: every EXIT the engine recorded ----
+      // This must use the SAME exit predicate as status.py's stats, or the table
+      // and the win-rate card describe different sets. An exit is identified by
+      // the reason the engine wrote on the order (trade_policy -> close_trade),
+      // or — for rows predating that column — by a non-zero realized PnL.
+      // Keying on `side === 'SELL'` was wrong twice over: a futures short closes
+      // with a BUY (invisible here), and it counted a FILLED leg with no PnL as a
+      // closed trade while the engine's own stats did not.
       const orderRows = json.data?.orders;
       if (Array.isArray(orderRows)) {
-        const exitOrders = orderRows.filter((o: any) => {
-          const side = String(o.side || '').toUpperCase();
-          const status = String(o.status || '').toUpperCase();
-          if (side !== 'SELL') return false;
-          const hasPnl = o.profit_loss !== null && o.profit_loss !== undefined;
-          if (status === 'FILLED') return true;
-          if (status === 'CANCELED') return hasPnl && parseFloat(o.profit_loss) !== 0;
-          return false;
-        });
+        const isExitOrder = (o: any): boolean => {
+          if (typeof o.exit_reason === 'string' && o.exit_reason.length > 0) return true;
+          const pnl = o.profit_loss;
+          if (pnl === null || pnl === undefined || pnl === '') return false;
+          return parseFloat(pnl) !== 0;
+        };
+        const exitOrders = orderRows.filter(isExitOrder);
         const mappedOrders: ClosedTrade[] = exitOrders.map((o: any) => {
           // Entry price: the engine attaches the matched BUY leg's avg_fill_price
           // as `entry_price` (market SELL rows store price=0, and `??` would not
@@ -740,9 +764,11 @@ export default function App() {
             entryTime: isFinite(entryTs) ? entryTs : exitTs,
             entryTimeEstimated: entryEstimated,
             exitTime: exitTs,
-            // Engine-derived close reason (STOP_LOSS/TAKE_PROFIT from realized
-            // outcome); fall back to the order-status heuristic on older engines.
-            exitReason: (o.exit_reason || (status === 'CANCELED' ? 'PARTIAL_EXIT' : 'MARKET_EXIT')) as ClosedTrade['exitReason']
+            // The engine's OWN reason when it recorded one; otherwise the label
+            // status.py inferred from the PnL sign, flagged as inferred so the
+            // table can mark a guess instead of colouring it as a win.
+            exitReason: (o.exit_reason || (status === 'CANCELED' ? 'PARTIAL_EXIT' : 'MARKET_EXIT')) as ClosedTrade['exitReason'],
+            exitReasonInferred: Boolean(o.exit_reason_inferred)
           };
         });
         setClosedTrades(mappedOrders);
@@ -1015,10 +1041,10 @@ export default function App() {
     }
   }, [vpsEndpoint, addLog, fetchVpsData]);
 
-  // Stream the real engine log into the Debug Console
+  // Stream the real engine log into the Debug Console (HTTP fallback; the /ws
+  // push above is the primary transport and shares this ingester).
   useEffect(() => {
     if (!vpsStatus.connected) return;
-    const seen = new Set<string>();
     const targetBase = (vpsEndpoint || (typeof window !== 'undefined' ? window.location.origin : '')).replace(/\/+$/, '');
     let cancelled = false;
     const fetchEngineLogs = async () => {
@@ -1027,21 +1053,7 @@ export default function App() {
         const res = await fetch(`${targetBase}/api/logs?lines=120`, { mode: 'cors' });
         if (!res.ok) return;
         const json = await res.json();
-        const lines: string[] = Array.isArray(json.lines) ? json.lines : [];
-        const lineRegex = /^(.+?) - (INFO|WARNING|ERROR|DEBUG|CRITICAL) - (.*)$/;
-        lines.forEach(raw => {
-          const match = lineRegex.exec(raw.trim());
-          if (!match) return;
-          const [, , level, message] = match;
-          if (!message.trim()) return;
-          const id = `${level}_${message.slice(0, 80)}`;
-          if (seen.has(id)) return;
-          seen.add(id);
-          const mappedLevel: LogMessage['level'] =
-            level === 'WARNING' ? 'WARN' : level === 'CRITICAL' ? 'ERROR' : (level as LogMessage['level']);
-          addLog(mappedLevel, 'SYS', message.trim());
-        });
-        if (seen.size > 4000) seen.clear();
+        ingestEngineLogLines(Array.isArray(json.lines) ? json.lines : []);
       } catch {
         // Engine log endpoint unreachable — the realtime channel will retry.
       }
@@ -1052,7 +1064,7 @@ export default function App() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [vpsStatus.connected, vpsEndpoint, addLog]);
+  }, [vpsStatus.connected, vpsEndpoint, ingestEngineLogLines]);
 
   // Apply the (single) preset
   const handleApplyPreset = useCallback((preset: StrategyPreset) => {
@@ -1128,6 +1140,7 @@ export default function App() {
             cooldownEndsAt={cooldownEndsAt}
             cooldownKind={cooldownKind}
             engineRisk={engineRisk}
+            engineRunning={vpsStatus.engineRunning}
             vpsConnected={vpsStatus.connected}
             vpsBalance={vpsBalance}
             onPushConfigToVps={pushConfigToVps}
