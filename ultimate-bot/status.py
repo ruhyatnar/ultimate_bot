@@ -2611,7 +2611,19 @@ def render_dashboard(env_config, db_path):
 
     paper_mode = env_config.get("PAPER_TRADE", "true").lower() == "true"
     preset = env_config.get("PRESET", "intraday_rsi")
-    symbols = env_config.get("STATIC_SYMBOLS", "BTCUSDT,ETHUSDT")
+    is_futures = env_config.get("MARKET", "spot").strip().lower() == "futures"
+    market_lbl = "FUTURES" if is_futures else "SPOT"
+    # The pair list the engine is ACTUALLY watching (risk_state.monitored_symbols),
+    # not a re-derivation from STATIC_SYMBOLS: with DYNAMIC_SYMBOLS=true the
+    # screener rotates MAX_SYMBOLS picks (and holds any symbol with an open
+    # trade), so the configured list describes a different universe. Fall back to
+    # STATIC_SYMBOLS only until the engine has published anything.
+    watched = _engine_watched_symbols(db_data)
+    symbols = (
+        ", ".join(watched)
+        if watched
+        else env_config.get("STATIC_SYMBOLS", "BTCUSDT,ETHUSDT")
+    )
     quote = env_config.get("QUOTE_ASSET", "USDT")
     control = read_control(
         env_config.get("CONTROL_FILE", "./data/engine_control.json")
@@ -2633,9 +2645,9 @@ def render_dashboard(env_config, db_path):
         f"{BOLD}{CYAN}========================================================================================{RESET}"
     )
     mode_tag = (
-        f"{CYAN}[PAPER TRADING - SIMULATED]{RESET}"
+        f"{CYAN}[{market_lbl} PAPER TRADING - SIMULATED]{RESET}"
         if paper_mode
-        else f"{GREEN}{BOLD}[LIVE PRODUCTION - REAL FUNDS]{RESET}"
+        else f"{GREEN}{BOLD}[{market_lbl} LIVE PRODUCTION - REAL FUNDS]{RESET}"
     )
     pause_tag = f" {RED}{BOLD}[WEB PAUSE ACTIVE]{RESET}" if is_paused else ""
     output.append(
@@ -2662,7 +2674,7 @@ def render_dashboard(env_config, db_path):
         )
     else:
         output.append(
-            f"  Total Spot Equity : {BOLD}${total_eq:,.2f} {quote}{RESET}    Available Free Quote : {BOLD}${free_q:,.2f} {quote}{RESET}"
+            f"  Total {market_lbl.title()} Equity : {BOLD}${total_eq:,.2f} {quote}{RESET}    Available Free Quote : {BOLD}${free_q:,.2f} {quote}{RESET}"
         )
         output.append(
             f"  In Open Positions : ${locked_q:,.2f} {quote}          Daily Realized PnL   : {pnl_color}${daily_pnl:+,.2f} {quote}{RESET}"
@@ -2747,7 +2759,7 @@ def render_dashboard(env_config, db_path):
                 else (YELLOW if o["status"] == "NEW" else RED)
             )
             pnl_val = float(o.get("profit_loss") or 0.0)
-            pnl_s = f"{pnl_val:+.2f} USDT" if pnl_val != 0 else "-"
+            pnl_s = f"{pnl_val:+.2f} {quote}" if pnl_val != 0 else "-"
             output.append(
                 f"  {t_str:<19} {o['symbol']:<10} {o['side']:<6} {o.get('price', 0):<10.2f} {o.get('executed_qty', 0):<10.4f} {s_color}{o['status']:<10}{RESET} {pnl_s:<12}"
             )
@@ -2988,12 +3000,19 @@ def get_standalone_html():
   <script>
     let isPaused = false;
 
+    // Escape engine/DB-sourced text before it goes into innerHTML (symbols,
+    // sides, statuses and asset names are interpolated into table markup).
+    function esc(v) {
+      return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, c =>
+        ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
     function applyStatus(data) {
         document.getElementById('timestamp').innerText = 'Last updated: ' + data.timestamp + (wsOk ? ' • live WebSocket push' : ' • polling every 2s');
 
         // Engine status badge
         const badge = document.getElementById('statusBadge');
-        if (data.process.includes('RUNNING')) {
+        if (String(data.process || '').includes('RUNNING')) {
           badge.className = 'badge badge-running';
           badge.innerText = '● ENGINE RUNNING';
         } else {
@@ -3001,10 +3020,17 @@ def get_standalone_html():
           badge.innerText = '● ENGINE STOPPED';
         }
 
-        // Mode badge
+        // Mode badge. Prefer the server's AUTHORITATIVE boolean (`paper_trade`) and
+        // market over re-deriving them from raw env strings: comparing the config
+        // string case-sensitively reported a paper engine as LIVE whenever the
+        // value was 'True'/'TRUE', and the label hard-coded SPOT under MARKET=futures.
+        const cfg = data.config || {};
         const modeEl = document.getElementById('modeBadge');
-        const isLive = data.config.PAPER_TRADE !== 'true';
-        modeEl.innerText = isLive ? 'LIVE SPOT REAL FUNDS' : 'PAPER SIMULATOR';
+        const isLive = (typeof data.paper_trade === 'boolean')
+          ? !data.paper_trade
+          : String(cfg.PAPER_TRADE === undefined ? 'true' : cfg.PAPER_TRADE).toLowerCase() !== 'true';
+        const marketLbl = String(data.market || cfg.MARKET || 'spot').toLowerCase() === 'futures' ? 'FUTURES' : 'SPOT';
+        modeEl.innerText = marketLbl + (isLive ? ' LIVE REAL FUNDS' : ' PAPER SIMULATOR');
         modeEl.style.background = isLive ? '#15803d' : '#0369a1';
 
         // Pause state
@@ -3076,7 +3102,7 @@ def get_standalone_html():
           balances.forEach(b => {
             const tot = parseFloat(b.total || (b.free + b.locked) || 0);
             const usd = b.usd_value ? ' ($' + parseFloat(b.usd_value).toFixed(1) + ')' : '';
-            chipsHtml += `<div class="asset-chip"><strong>${b.asset}</strong>: ${tot.toFixed(4)}${usd}</div>`;
+            chipsHtml += `<div class="asset-chip"><strong>${esc(b.asset)}</strong>: ${tot.toFixed(4)}${usd}</div>`;
           });
           document.getElementById('assetChips').innerHTML = chipsHtml;
         }
@@ -3098,10 +3124,16 @@ def get_standalone_html():
             const entry = parseFloat(t.entry_price || 0);
             const now = parseFloat(t.current_price || 0) || entry;
             const qty = parseFloat(t.quantity || 0);
-            const pnl = (now - entry) * qty;
+            // Prefer the engine's OWN unrealized PnL (served by status.py for every
+            // tracked position). Recomputing (now - entry) * qty here disagreed with
+            // the engine and flipped the sign for a futures SHORT, whose entry side
+            // is SELL — the direction factor fixes the fallback.
+            const served = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? null : parseFloat(t.unrealized_pnl);
+            const dir = t.side === 'SELL' ? -1 : 1;
+            const pnl = served !== null && !isNaN(served) ? served : (now - entry) * qty * dir;
             const pnlCol = pnl >= 0 ? '#34d399' : '#fb7185';
-            const chg = entry > 0 ? ((now - entry) / entry) * 100 : 0;
-            html += `<tr><td><strong>${t.symbol}</strong></td><td style="color:${t.side==='BUY'?'#34d399':'#fb7185'}">${t.side}</td><td>$${entry.toFixed(4)}</td><td>$${now.toFixed(4)} <span style="color:${pnlCol};font-size:11px">(${chg>=0?'+':''}${chg.toFixed(2)}%)</span></td><td>${qty.toFixed(4)}</td><td>$${parseFloat(t.stop_price||0).toFixed(4)}</td><td>$${parseFloat(t.take_profit||0).toFixed(4)}</td><td style="color:${pnlCol}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</td><td>${t.breakeven_activated?'<span style="color:#34d399">LOCKED</span>':'No'}</td></tr>`;
+            const chg = entry > 0 ? ((now - entry) / entry) * 100 * dir : 0;
+            html += `<tr><td><strong>${esc(t.symbol)}</strong></td><td style="color:${t.side==='BUY'?'#34d399':'#fb7185'}">${esc(t.side)}</td><td>$${entry.toFixed(4)}</td><td>$${now.toFixed(4)} <span style="color:${pnlCol};font-size:11px">(${chg>=0?'+':''}${chg.toFixed(2)}%)</span></td><td>${qty.toFixed(4)}</td><td>$${parseFloat(t.stop_price||0).toFixed(4)}</td><td>$${parseFloat(t.take_profit||0).toFixed(4)}</td><td style="color:${pnlCol}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</td><td>${t.breakeven_activated?'<span style="color:#34d399">LOCKED</span>':'No'}</td></tr>`;
           });
           html += '</tbody></table>';
           document.getElementById('positionsTable').innerHTML = html;
@@ -3119,7 +3151,7 @@ def get_standalone_html():
             const volStr = '$' + (parseFloat(c.volume_24h || 0) / 1e6).toFixed(1) + 'M';
             const status = c.is_selected ? '<span style="color:#34d399; font-weight:bold;">● ACTIVE</span>' : '<span style="color:#64748b;">WATCH</span>';
             const bo = c.breakout ? '<span style="color:#fbbf24; font-weight:bold;">YES</span>' : 'NO';
-            html += `<tr><td>${idx+1}</td><td><strong>${c.symbol}</strong></td><td>$${parseFloat(c.price||0).toFixed(2)}</td><td style="color:${chgColor}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</td><td>${volStr}</td><td>${parseFloat(c.adx||0).toFixed(1)}</td><td>${c.trend_dir||'UP'}</td><td>${bo}</td><td>${status}</td></tr>`;
+            html += `<tr><td>${idx+1}</td><td><strong>${esc(c.symbol)}</strong></td><td>$${parseFloat(c.price||0).toFixed(2)}</td><td style="color:${chgColor}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</td><td>${volStr}</td><td>${parseFloat(c.adx||0).toFixed(1)}</td><td>${esc(c.trend_dir||'UP')}</td><td>${bo}</td><td>${status}</td></tr>`;
           });
           html += '</tbody></table>';
           document.getElementById('scannedTable').innerHTML = html;
@@ -3134,7 +3166,7 @@ def get_standalone_html():
           orders.slice(0, 8).forEach(o => {
             const pnl = parseFloat(o.profit_loss || 0);
             const pnlStr = pnl !== 0 ? `<span style="color:${pnl>=0?'#34d399':'#fb7185'}">${pnl>=0?'+':''}${pnl.toFixed(2)} USDT</span>` : '-';
-            html += `<tr><td class="time">${o.created_at || '-'}</td><td><strong>${o.symbol}</strong></td><td style="color:${o.side==='BUY'?'#34d399':'#fb7185'}">${o.side}</td><td>$${parseFloat(o.price||0).toFixed(2)}</td><td>${parseFloat(o.executed_qty||0).toFixed(4)}</td><td><span style="color:#34d399">${o.status}</span></td><td>${pnlStr}</td></tr>`;
+            html += `<tr><td class="time">${esc(o.created_at || '-')}</td><td><strong>${esc(o.symbol)}</strong></td><td style="color:${o.side==='BUY'?'#34d399':'#fb7185'}">${esc(o.side)}</td><td>$${parseFloat(o.price||0).toFixed(2)}</td><td>${parseFloat(o.executed_qty||0).toFixed(4)}</td><td><span style="color:#34d399">${esc(o.status)}</span></td><td>${pnlStr}</td></tr>`;
           });
           html += '</tbody></table>';
           document.getElementById('ordersTable').innerHTML = html;

@@ -26,6 +26,52 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 
 ## 📝 Changelog
 
+### 2026-09-26 (14) — CLI monitor audit: it named the wrong universe and the wrong venue
+
+**`render_dashboard` — the terminal monitor — was audited against the payload contract the HTTP,
+`/ws`, standalone-page and React surfaces share.** Three config-re-derivation discrepancies found.
+
+- **It printed `STATIC_SYMBOLS` as "Monitored Symbols".** With `DYNAMIC_SYMBOLS=true` the screener
+  rotates the traded set and publishes it at `risk_state.monitored_symbols`, so the CLI named a
+  universe the engine was not watching and disagreed with the served `monitored_symbols`. It now
+  reads `_engine_watched_symbols(db_data)`, falling back to `STATIC_SYMBOLS` only before the engine
+  publishes.
+- **The LIVE header hard-coded "Total Spot Equity", and the mode tag named no venue.** A
+  `MARKET=futures` run was labelled as a spot account. Both now derive the venue label from `MARKET`,
+  matching the `mode` field / account chip the other surfaces render.
+- **Realized order PnL hard-coded "USDT".** The recent-orders table now denominate in the configured
+  `QUOTE_ASSET`.
+- New `test_scenarios.py` **S18** (5 checks), each mutation-verified with synthetic `db_data` (no
+  network, no DB).
+
+Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (126) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys, untouched).
+
+### 2026-09-26 (13) — Standalone dashboard audit: it lied about mode and recomputed PnL
+
+**`get_standalone_html` — the fallback dashboard served when no compiled `dist/` exists — was audited
+against the payload it consumes.** It renders only when the React build is absent, so it drifts
+silently. Three defects found.
+
+- **The LIVE/PAPER badge compared the raw config string case-sensitively**
+  (`data.config.PAPER_TRADE !== 'true'`). Any capitalisation the engine still treats as paper
+  (`True`, `TRUE`) made it read **LIVE REAL FUNDS** on a paper engine — dangerous. It also hard-coded
+  `SPOT`, so `MARKET=futures` still read "LIVE SPOT". The badge now reads the served `paper_trade`
+  boolean and `market` field (falling back to a lower-cased config compare).
+- **The active-positions table recomputed PnL as `(now - entry) * qty` and ignored the engine's own
+  served `unrealized_pnl`.** For a futures **short** (entry side `SELL`) that flips the sign, so a
+  profitable short rendered as a loss and disagreed with the engine and the React dashboard. It now
+  prefers `unrealized_pnl` and applies a direction factor to the fallback.
+- **Engine/DB strings (symbol, side, status, trend, asset) were interpolated into `innerHTML`
+  unescaped.** React escapes by default; this page did not. An `esc()` helper now wraps every text
+  field. Also hardened the process badge (`String(data.process || '')`) so a payload missing the field
+  cannot throw and freeze the page.
+- Verified in real Chromium and by `node --check` on the extracted script. New `test_scenarios.py`
+  **S17** (5 checks), each mutation-verified.
+
+Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (121) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys, untouched).
+
 ### 2026-09-26 (12) — WS + control audit: pause could drop an emergency close
 
 **`status.py`'s WebSocket send lifecycle and its `/api/control` POST path were audited. Two
@@ -2402,7 +2448,13 @@ balance (`paper_start_balance` is not written either). **S14** guards the browse
 re-read: a rotated watchlist must trigger a re-read, not a false `missing: [...]` failure, while a
 genuine threshold disagreement is still detected.
 
-Exit code 0 = `ALL_OK` (116 checks), 1 = at least one failure, which is named.
+**S18 guards the CLI monitor** — `render_dashboard` must name the same universe and venue as every
+other surface: the engine's published `monitored_symbols` (not a `STATIC_SYMBOLS` re-derivation, with
+the config list as the pre-publish fallback), a `MARKET=futures` live account labelled as futures
+(not "Total Spot Equity") with a venue-naming mode tag, and realized order PnL denominated in the
+configured `QUOTE_ASSET`. The checks render against synthetic `db_data` — no network, no DB.
+
+Exit code 0 = `ALL_OK` (126 checks), 1 = at least one failure, which is named.
 
 ### Config Drift Check (`check_env_drift.py`)
 

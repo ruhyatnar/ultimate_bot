@@ -1202,6 +1202,205 @@ def _s16_ws_tests():
 _s16_control_tests()
 _s16_ws_tests()
 
+# --- S17: the standalone fallback dashboard (get_standalone_html) ---
+# The page is only served when no compiled dist/ exists, so it silently drifts
+# from the payload contract. Three defects found and fixed there:
+#  * the LIVE/PAPER badge compared the raw config STRING case-sensitively
+#    (`PAPER_TRADE !== 'true'`), so 'True'/'TRUE' made a paper engine report
+#    LIVE, and the label hard-coded SPOT under MARKET=futures;
+#  * the active-positions table recomputed PnL as (now-entry)*qty and ignored the
+#    engine's own served `unrealized_pnl` — wrong sign for a futures SHORT;
+#  * engine/DB strings (symbol/side/status/trend/asset) were interpolated into
+#    innerHTML unescaped.
+import status as _st17
+
+_s17_html = _st17.get_standalone_html()
+check(
+    "S17 standalone dashboard trusts the served paper_trade boolean (no case-sensitive config compare)",
+    "typeof data.paper_trade === 'boolean'" in _s17_html
+    and "LIVE SPOT REAL FUNDS" not in _s17_html,
+    "authoritative mode field missing",
+)
+check(
+    "S17 standalone dashboard derives the market label from data.market",
+    "data.market || cfg.MARKET" in _s17_html and "marketLbl" in _s17_html,
+    "market label still hard-coded",
+)
+check(
+    "S17 standalone positions table prefers the engine's served unrealized_pnl",
+    "t.unrealized_pnl" in _s17_html
+    and "t.side === 'SELL' ? -1 : 1" in _s17_html,
+    "PnL recomputed from entry/mark without a sign factor",
+)
+check(
+    "S17 standalone dashboard escapes engine/DB strings before innerHTML",
+    "function esc(" in _s17_html
+    and "esc(c.trend_dir" in _s17_html
+    and "esc(o.status" in _s17_html
+    and "esc(b.asset)" in _s17_html,
+    "unescaped interpolation left in table markup",
+)
+check(
+    "S17 standalone process badge tolerates a missing process field",
+    "String(data.process || '')" in _s17_html,
+    "bare data.process.includes(...) can throw and freeze the page",
+)
+
+# --- S18: the CLI monitor (render_dashboard) ---
+# The terminal monitor silently drifted from the payload contract that every
+# other surface (HTTP /api/status, /ws, the standalone page, the React UI)
+# shares:
+#  * it printed STATIC_SYMBOLS as "Monitored Symbols", while the engine actually
+#    rotates a screener-selected set published at risk_state.monitored_symbols —
+#    the same re-derivation the roadmap/UI fixes removed (the configured list
+#    describes a DIFFERENT universe once DYNAMIC_SYMBOLS=true);
+#  * the LIVE balance header hard-coded "Total Spot Equity" and the mode tag
+#    named no venue, so a MARKET=futures run was mislabelled as a spot account;
+#  * realized order PnL hard-coded "USDT" regardless of QUOTE_ASSET.
+import tempfile as _s18_tempfile
+import status as _st18
+
+_s18_real_read = _st18.read_database
+_s18_real_balance = _st18.fetch_binance_balance
+_s18_ctl = os.path.join(_s18_tempfile.mkdtemp(prefix="s18-"), "ctl.json")
+
+_s18_pairs = [
+    {
+        "symbol": "NEARUSDT",
+        "price": 2.5,
+        "price_change_24h": 1.0,
+        "volume_24h": 5_000_000,
+        "adx": 22.0,
+        "trend_dir": "UP",
+        "is_selected": True,
+        "breakout": False,
+    }
+]
+
+
+def _s18_render(env, db_data, balance=None):
+    _st18.read_database = lambda _p: db_data
+    if balance is not None:
+        _st18.fetch_binance_balance = lambda _e, _d: balance
+    try:
+        env = dict(env, CONTROL_FILE=_s18_ctl)
+        return _st18.render_dashboard(env, "/nonexistent-s18.db")
+    finally:
+        _st18.read_database = _s18_real_read
+        _st18.fetch_binance_balance = _s18_real_balance
+
+
+def _s18_line(out, needle):
+    for line in out.splitlines():
+        if needle in line:
+            return line
+    return ""
+
+
+# 1. The engine's published watch set wins over the configured STATIC_SYMBOLS.
+_db_watch = {
+    "risk": {
+        "monitored_symbols": '["NEARUSDT","LINKUSDT"]',
+        "paper_balance": "1500",
+    },
+    "trades": [],
+    "orders": [],
+    "stats": {},
+    "scanned_pairs": _s18_pairs,
+}
+out = _s18_render(
+    {"PAPER_TRADE": "true", "STATIC_SYMBOLS": "BTCUSDT,ETHUSDT"},
+    _db_watch,
+)
+watch_line = _s18_line(out, "Monitored Symbols")
+check(
+    "S18 CLI monitor shows the engine's watched set, not STATIC_SYMBOLS",
+    "NEARUSDT" in watch_line
+    and "LINKUSDT" in watch_line
+    and "BTCUSDT" not in watch_line,
+    watch_line,
+)
+
+# 2. Before the engine publishes anything, fall back to the configured list.
+_db_nowatch = {
+    "risk": {"paper_balance": "1500"},
+    "trades": [],
+    "orders": [],
+    "stats": {},
+    "scanned_pairs": _s18_pairs,
+}
+out = _s18_render(
+    {"PAPER_TRADE": "true", "STATIC_SYMBOLS": "BTCUSDT,ETHUSDT"},
+    _db_nowatch,
+)
+watch_line = _s18_line(out, "Monitored Symbols")
+check(
+    "S18 CLI monitor falls back to STATIC_SYMBOLS before the engine publishes",
+    "BTCUSDT" in watch_line,
+    watch_line,
+)
+
+# 3. A live MARKET=futures account is not labelled as a spot account.
+_bal_futures = {
+    "is_live": True,
+    "quote_asset": "USDT",
+    "account": "FUTURES Live",
+    "total_equity": 100.0,
+    "free_quote": 80.0,
+    "locked_quote": 20.0,
+    "daily_pnl": 1.0,
+    "balances": [],
+    "source": "db",
+    "age_s": None,
+}
+out = _s18_render(
+    {
+        "PAPER_TRADE": "false",
+        "MARKET": "futures",
+        "STATIC_SYMBOLS": "NEARUSDT",
+    },
+    _db_watch,
+    balance=_bal_futures,
+)
+check(
+    "S18 CLI live header is market-aware (no hard-coded Spot under futures)",
+    "Total Futures Equity" in out and "Total Spot Equity" not in out,
+    _s18_line(out, "Equity"),
+)
+check(
+    "S18 CLI mode tag names the venue instead of implying spot",
+    "FUTURES LIVE PRODUCTION" in out,
+    _s18_line(out, "Mode :"),
+)
+
+# 4. Realized order PnL is denominated in the configured quote asset.
+_db_orders = {
+    "risk": {"paper_balance": "1500"},
+    "trades": [],
+    "orders": [
+        {
+            "status": "FILLED",
+            "symbol": "NEARUSDT",
+            "side": "SELL",
+            "price": 2.5,
+            "executed_qty": 10.0,
+            "created_at": 1_700_000_000_000,
+            "profit_loss": 5.0,
+        }
+    ],
+    "stats": {},
+    "scanned_pairs": _s18_pairs,
+}
+out = _s18_render(
+    {"PAPER_TRADE": "true", "STATIC_SYMBOLS": "NEARUSDT", "QUOTE_ASSET": "USDC"},
+    _db_orders,
+)
+check(
+    "S18 CLI order PnL uses the configured quote asset, not a hard-coded USDT",
+    "5.00 USDC" in out and "5.00 USDT" not in out,
+    _s18_line(out, "NEARUSDT"),
+)
+
 print()
 print("ALL_OK" if not FAILS else f"FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

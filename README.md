@@ -703,7 +703,7 @@ All commands run from the repo root unless noted. `npm run smoke` and friends ha
 | **Config drift** | `npm run check:env` | `.env` vs `.env.example`: keys present in only one file, duplicate keys, inline `#` comments on value lines, value drift, and that no real credential has reached the template | **IN SYNC** |
 | Engine smoke | `npm run smoke` | Boot, single-instance lock, second-instance rejection, web-monitor stats consistency, clean SIGTERM shutdown and lock release (isolated temp DB) | **13/13** |
 | Sync integration | `npm run test:sync` | Engine ↔ monitor end-to-end: real engine boot, `/api/status` + `/ws` payload, streaks, control channel, DB↔UI agreement, **active-position sync** (E2: the served row carries the engine's mark/uPnL/size, per-position leverage/margin normalised, untracked positions counted not double-counted — counts asserted as the `tracked ∪ live` partition derived from the payload, not hardcoded), **loop heartbeat + pause acknowledgement** (B1), **roadmap watchlist** (E3: `roadmap.pairs` == the served `monitored_symbols`, ok/blocked partition the watched set, each pair publishes its own floor-clearing threshold, a rotation invalidates the cache, a **failed** refresh is backed off rather than retried on every 1 Hz payload build, and the last good snapshot survives it), **soak contract** (E4: the payload always carries `soak` — `null` hides the card — and a live soak exposes the fields the card reads), **exit attribution** (D2: the boot migration added `orders.exit_reason`, the engine's own reason is served verbatim, a scale-out's legs are not counted as separate trades, a short's BUY closing order is a closed trade with its entry taken from the SELL leg, a legacy row is flagged inferred, and the realized total matches an independent exit-predicate sum), **realtime push** (B2: the periodic pusher genuinely delivers status frames to a connected socket, not just the connect snapshot — the check that catches a dead pusher), **engine-log contract** (H: `/api/logs` clamps `lines=`, serves only newline-terminated records, and the `/ws` channel pushes appended records whole) | **78/78** |
-| Failure scenarios | `npm run test:scenarios` | Offline battery S1–S16 (incl. S6 order-routing `reduce_only` contract, S7 multi-assets balance seed, **S8 the shared exit decision** — ordering, reason labels, gap-aware fills, **S9 active-trade persistence** — flush on change, heartbeat, DB-failure tolerance, **S10 roadmap CLI per-pair thresholds**, **S11 exit attribution** — trades vs legs, net-PnL classification, side-agnostic exits, opposite-side entry matching, inferred flags, numeric streaks, and the window-function-free stats fallback, **S12 engine-log tail contract** — the `lines=` clamp, block-stitching backward scan, partial-record carry, rotation restart, and the `0 ms` clock-offset sentinel on both REST clients, **S13 the soak surface** — the shared `trade_stats` predicate (a short's BUY exit, legs-not-trades, schema probe), the soak card's counts/PnL/last-exit/live soak length, and the watchdog summary agreeing with the card, **S14 the browser check's roadmap re-read**, **S15 the market screener's cache** — a failed (or empty) live fetch is backed off instead of blocking a 4s request in front of every 1 Hz payload build, the last good list keeps being served, and engine-published `scanned_pairs` bypass the network entirely, **S16 the WS + control surface** — a pending `close_all`/`close_symbol` survives `pause`/`resume` so an in-flight emergency close is never dropped, the control read-modify-write is serialized against concurrent POSTs (no lost update), close_symbol dedupe and unknown-action/blank-symbol rejection hold, and concurrent sends to one WebSocket share a per-socket lock so frames never interleave) | **ALL OK** (116 checks, S8: 13, S9: 8, S10: 6, S11: 13, S12: 27, S13: 13, S14: 3, S15: 6, S16: 8) |
+| Failure scenarios | `npm run test:scenarios` | Offline battery S1–S18 (incl. S6 order-routing `reduce_only` contract, S7 multi-assets balance seed, **S8 the shared exit decision** — ordering, reason labels, gap-aware fills, **S9 active-trade persistence** — flush on change, heartbeat, DB-failure tolerance, **S10 roadmap CLI per-pair thresholds**, **S11 exit attribution** — trades vs legs, net-PnL classification, side-agnostic exits, opposite-side entry matching, inferred flags, numeric streaks, and the window-function-free stats fallback, **S12 engine-log tail contract** — the `lines=` clamp, block-stitching backward scan, partial-record carry, rotation restart, and the `0 ms` clock-offset sentinel on both REST clients, **S13 the soak surface** — the shared `trade_stats` predicate (a short's BUY exit, legs-not-trades, schema probe), the soak card's counts/PnL/last-exit/live soak length, and the watchdog summary agreeing with the card, **S14 the browser check's roadmap re-read**, **S15 the market screener's cache** — a failed (or empty) live fetch is backed off instead of blocking a 4s request in front of every 1 Hz payload build, the last good list keeps being served, and engine-published `scanned_pairs` bypass the network entirely, **S16 the WS + control surface** — a pending `close_all`/`close_symbol` survives `pause`/`resume` so an in-flight emergency close is never dropped, the control read-modify-write is serialized against concurrent POSTs (no lost update), close_symbol dedupe and unknown-action/blank-symbol rejection hold, and concurrent sends to one WebSocket share a per-socket lock so frames never interleave, **S17 the standalone fallback dashboard** — the LIVE/PAPER badge trusts the served `paper_trade` boolean (not a case-sensitive config compare), the market label comes from `data.market`, active positions read the engine's `unrealized_pnl`, engine/DB strings are HTML-escaped, and a missing `process` field cannot freeze the page, **S18 the CLI monitor** — it lists the engine's published `monitored_symbols` rather than re-deriving the universe from `STATIC_SYMBOLS`, labels a `MARKET=futures` live account as futures (not "Total Spot Equity") with a venue-naming mode tag, and denominates realized order PnL in the configured `QUOTE_ASSET`) | **ALL OK** (126 checks, S8: 13, S9: 8, S10: 6, S11: 13, S12: 27, S13: 13, S14: 3, S15: 6, S16: 8, S17: 5, S18: 5) |
 | Futures reconcile | `./venv/bin/python3 ultimate-bot/test_futures_reconcile.py` | Reconcile reads `positionAmt`, not wallet balance | **ALL OK** |
 | Browser render | `npm run test:browser` | Renders the **live page in real headless Chromium** over the Chrome DevTools Protocol (no Playwright/Puppeteer dependency, nothing downloaded) and asserts 15 things about the DOM: 5 desk sections, 5-tab nav, no `NaN`/`undefined`/`Infinity` canaries, no uncaught JS exception, every request succeeded, and the Capital Roadmap card **laid out and visible** with a chip per pair whose threshold matches the served `roadmap.pairs[].required_equity` — so a chip regressing to a literal fails. Needs a running monitor *and* a browser; prints `SKIP` and exits 0 without either (`--strict` makes a skip a failure) | **BROWSER_OK** (15/15) / SKIP |
 | Dashboard UI | `npm run test:ui` | 33 SSR tests: 6 desk sections, bracket ladder, breaker, cooldown, flat state, engine stats, screener empty state, untracked PnL, futures chip, **stale-position flag**, **loop-heartbeat source**, **pause acknowledgement**, **roadmap universe label**, **blocked-pair thresholds**, **newest-first trade table**, **engine trade count in the header**, **inferred-reason marking**, **engine-published process state**, **published loop cadence**, **streak-cooldown chip**, **shared freshness budget**, **engine-log line identity** (the engine's own clock, repeats not collapsed, an 80-char prefix not conflated, FIFO eviction, tracebacks kept), **multi-line rendering**, **app shell (5 tabs)**, tab bodies | **33/33** |
@@ -854,6 +854,24 @@ Re-audited on 2026-09-22 (every tracked file, every function, both languages).
   close-preserving `pause`/`resume`, and a per-socket send lock (`_ws_sock_send`). Guarded by
   `test_scenarios.py` **S16**, every check mutation-verified. See the changelog entry for
   2026-09-26 (12).
+- **The standalone fallback dashboard states the engine's own facts, in the right direction.** The
+  page served when no compiled `dist/` exists compared the raw `PAPER_TRADE` config **string**
+  case-sensitively, so `True`/`TRUE` displayed **LIVE** on a paper engine, and it hard-coded SPOT for
+  the market label. Its active-positions table recomputed PnL from entry/mark instead of the
+  engine's served `unrealized_pnl`, flipping the sign for a futures short, and it interpolated
+  engine/DB strings into `innerHTML` unescaped. Fixed with the authoritative `paper_trade`/`market`
+  fields, the served PnL (with a direction-aware fallback), and an `esc()` helper. Guarded by
+  `test_scenarios.py` **S17**, every check mutation-verified. See the changelog entry for
+  2026-09-26 (13).
+- **The CLI monitor shows the same universe and venue as every other surface.** `render_dashboard`
+  printed `STATIC_SYMBOLS` as "Monitored Symbols" — a re-derivation from config, so with
+  `DYNAMIC_SYMBOLS=true` it named a different universe than the engine was trading, disagreeing with
+  the served `monitored_symbols` the web UI reads. It also hard-coded "Total Spot Equity" for a
+  `MARKET=futures` account and "USDT" for realized order PnL, and its mode tag named no venue. Fixed
+  to read the engine's watch set (`_engine_watched_symbols`, falling back to `STATIC_SYMBOLS` only
+  before the engine publishes), to label/mode-tag the venue from `MARKET`, and to denominate PnL in
+  `QUOTE_ASSET`. Guarded by `test_scenarios.py` **S18**, every check mutation-verified. See the
+  changelog entry for 2026-09-26 (14).
 - **No config drift:** `.env` and `.env.example` share all **90 keys with zero drift** (the
   only differences are the three credential keys, which keep placeholders). Nine keys
 disagreed before the 2026-09-22 reconciliation recorded in the changelog.
@@ -926,6 +944,56 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 Newest first. Entries marked **⚙️ engine** carry deeper detail in
 [ultimate-bot/README.md](./ultimate-bot/README.md).
+
+### 2026-09-26 (14) — CLI monitor audit: it named the wrong universe and the wrong venue 🖥️
+
+**`status.py`'s `render_dashboard` — the terminal monitor — was audited against the same payload
+contract every other surface shares.** Three discrepancies were found, all in the "re-derive it from
+config" class that the roadmap, UI and standalone-page fixes already removed elsewhere.
+
+- **It printed `STATIC_SYMBOLS` as "Monitored Symbols".** With `DYNAMIC_SYMBOLS=true` the screener
+  rotates the traded set (`MAX_SYMBOLS` picks plus any symbol holding an open trade) and publishes it
+  at `risk_state.monitored_symbols` — so the CLI named a universe the engine was not watching, and it
+  disagreed with the `monitored_symbols` field the web UI shows. It now reads the engine's watch set
+  via `_engine_watched_symbols`, falling back to `STATIC_SYMBOLS` only until the engine has published.
+- **The LIVE header hard-coded "Total Spot Equity", and the mode tag named no venue.** A
+  `MARKET=futures` run was labelled as a spot account. Both now derive from `MARKET` (`SPOT` /
+  `FUTURES`), matching the `mode` field and account chip the other surfaces render.
+- **Realized order PnL hard-coded "USDT".** The recent-orders table now denominate in the configured
+  `QUOTE_ASSET`, as the balance rows already did.
+- Verified offline with synthetic `db_data` (no network, no DB). New `test_scenarios.py` **S18**
+  (5 checks), each mutation-verified: reverting each fix fails its check(s).
+
+**Full gate:** `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (126) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys).
+
+### 2026-09-26 (13) — Standalone dashboard audit: it lied about mode and recomputed PnL 🔍
+
+**`status.py`'s `get_standalone_html` — the fallback dashboard served when no compiled `dist/`
+exists — was audited against the payload it consumes.** It is only rendered when the React build is
+missing, so it drifts silently; three defects were found.
+
+- **The LIVE/PAPER badge compared the raw config *string* case-sensitively**
+  (`data.config.PAPER_TRADE !== 'true'`) instead of trusting the server's authoritative boolean. Any
+  capitalisation the engine still treats as paper (`True`, `TRUE`) made the badge claim **LIVE REAL
+  FUNDS** on a paper engine — a misleading, dangerous display. It also hard-coded `SPOT` as the
+  market, so `MARKET=futures` still read "LIVE SPOT". The badge now reads the served `paper_trade`
+  boolean and `market` field (falling back to a lower-cased config compare).
+- **The active-positions table recomputed PnL as `(now - entry) * qty` and ignored the engine's own
+  served `unrealized_pnl`** — the exact value `status.py` joins onto every tracked row. For a futures
+  **short** (entry side `SELL`) that flips the sign, so a profitable short rendered as a loss and
+  disagreed with both the engine and the React dashboard. It now prefers `unrealized_pnl` and applies
+  a direction factor to the fallback.
+- **Engine/DB strings (symbol, side, status, trend, asset) were interpolated into `innerHTML`
+  unescaped.** React escapes by default; the standalone page did not, so a crafted symbol would
+  inject markup into the monitor. An `esc()` helper now wraps every text field.
+- Also hardened the process badge (`String(data.process || '')`) so a payload momentarily missing the
+  field cannot throw and freeze every subsequent update.
+- Verified in real Chromium and by `node --check` on the extracted script. New `test_scenarios.py`
+  **S17** (5 checks), each mutation-verified: reverting the three fixes fails all five checks.
+
+**Full gate:** `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (121) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys).
 
 ### 2026-09-26 (12) — WS + control audit: pause could drop an emergency close ⚙️
 
