@@ -26,6 +26,42 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 
 ## 📝 Changelog
 
+### 2026-09-26 (12) — WS + control audit: pause could drop an emergency close
+
+**`status.py`'s WebSocket send lifecycle and its `/api/control` POST path were audited. Two
+functional defects, both reproduced offline.**
+
+- **`/api/control` `pause`/`resume` silently dropped a pending close command.** The handler popped
+  `command_id`, `close_all` **and** `close_symbol` from the control file. But the engine keeps a
+  close command pending — and retries rejected exits — until every requested position is actually
+  closed (`trade_logic._process_control_commands`). An operator who hit *Pause* while a `close_all`
+  was mid-liquidation (an exit rejected, retrying next loop) had the emergency close erased on the
+  next write: the engine's mtime-triggered re-read saw no close, and the position was abandoned.
+  The `/api/config` push path documents that it deliberately leaves the control file untouched for
+  exactly this reason; pause was the inconsistent path. Only a **stale** `command_id` (no close
+  pending) is cleared now.
+- **The control read-modify-write was unsynchronized.** `ThreadingHTTPServer` runs one thread per
+  connection, so two concurrent POSTs (two operators, a click racing a retry) could both read the
+  same control dict and the second write clobbered the first — a `pause` and a `close_all` arriving
+  together left only one of them. The whole read → mutate → write now runs under `_CONTROL_LOCK`.
+- **The pusher thread and the per-client thread both wrote the same socket with bare `sendall()`.**
+  The pusher broadcasts status snapshots (1 Hz) and log tails while the client thread answers
+  app-level pings, keepalives and the close handshake — two concurrent `sendall()` calls can
+  interleave partial frames and corrupt the stream. Every write goes through `_ws_sock_send` now,
+  which serializes on a **per-socket** lock, so a slow client never blocks the others or the pusher.
+
+**New checks (`test_scenarios.py` S16, 8 — all mutation-verified against the pre-fix code):**
+
+- a pending `close_all` survives a `pause` (and `close_symbol` survives `resume`), `command_id` intact;
+- a stale `command_id` with no close pending is still cleared;
+- a concurrent `pause` + `close_all` both persist (no lost update against the pre-fix race);
+- repeated `close_symbol` still re-uses the pending command; unknown action / blank symbol → 400;
+- eight concurrent sends to one socket never interleave; the broadcast path and a direct reply share
+  the same lock.
+
+Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (116) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys, untouched).
+
 ### 2026-09-25 (11) — Screener cache: a dead ticker endpoint stalled the 1 Hz payload path
 
 **The last blocking network read in `build_status_payload` without a failure backoff.** The capital
@@ -2366,7 +2402,7 @@ balance (`paper_start_balance` is not written either). **S14** guards the browse
 re-read: a rotated watchlist must trigger a re-read, not a false `missing: [...]` failure, while a
 genuine threshold disagreement is still detected.
 
-Exit code 0 = `ALL_OK` (108 checks), 1 = at least one failure, which is named.
+Exit code 0 = `ALL_OK` (116 checks), 1 = at least one failure, which is named.
 
 ### Config Drift Check (`check_env_drift.py`)
 

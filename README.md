@@ -703,7 +703,7 @@ All commands run from the repo root unless noted. `npm run smoke` and friends ha
 | **Config drift** | `npm run check:env` | `.env` vs `.env.example`: keys present in only one file, duplicate keys, inline `#` comments on value lines, value drift, and that no real credential has reached the template | **IN SYNC** |
 | Engine smoke | `npm run smoke` | Boot, single-instance lock, second-instance rejection, web-monitor stats consistency, clean SIGTERM shutdown and lock release (isolated temp DB) | **13/13** |
 | Sync integration | `npm run test:sync` | Engine ↔ monitor end-to-end: real engine boot, `/api/status` + `/ws` payload, streaks, control channel, DB↔UI agreement, **active-position sync** (E2: the served row carries the engine's mark/uPnL/size, per-position leverage/margin normalised, untracked positions counted not double-counted — counts asserted as the `tracked ∪ live` partition derived from the payload, not hardcoded), **loop heartbeat + pause acknowledgement** (B1), **roadmap watchlist** (E3: `roadmap.pairs` == the served `monitored_symbols`, ok/blocked partition the watched set, each pair publishes its own floor-clearing threshold, a rotation invalidates the cache, a **failed** refresh is backed off rather than retried on every 1 Hz payload build, and the last good snapshot survives it), **soak contract** (E4: the payload always carries `soak` — `null` hides the card — and a live soak exposes the fields the card reads), **exit attribution** (D2: the boot migration added `orders.exit_reason`, the engine's own reason is served verbatim, a scale-out's legs are not counted as separate trades, a short's BUY closing order is a closed trade with its entry taken from the SELL leg, a legacy row is flagged inferred, and the realized total matches an independent exit-predicate sum), **realtime push** (B2: the periodic pusher genuinely delivers status frames to a connected socket, not just the connect snapshot — the check that catches a dead pusher), **engine-log contract** (H: `/api/logs` clamps `lines=`, serves only newline-terminated records, and the `/ws` channel pushes appended records whole) | **78/78** |
-| Failure scenarios | `npm run test:scenarios` | Offline battery S1–S15 (incl. S6 order-routing `reduce_only` contract, S7 multi-assets balance seed, **S8 the shared exit decision** — ordering, reason labels, gap-aware fills, **S9 active-trade persistence** — flush on change, heartbeat, DB-failure tolerance, **S10 roadmap CLI per-pair thresholds**, **S11 exit attribution** — trades vs legs, net-PnL classification, side-agnostic exits, opposite-side entry matching, inferred flags, numeric streaks, and the window-function-free stats fallback, **S12 engine-log tail contract** — the `lines=` clamp, block-stitching backward scan, partial-record carry, rotation restart, and the `0 ms` clock-offset sentinel on both REST clients, **S13 the soak surface** — the shared `trade_stats` predicate (a short's BUY exit, legs-not-trades, schema probe), the soak card's counts/PnL/last-exit/live soak length, and the watchdog summary agreeing with the card, **S14 the browser check's roadmap re-read**, **S15 the market screener's cache** — a failed (or empty) live fetch is backed off instead of blocking a 4s request in front of every 1 Hz payload build, the last good list keeps being served, and engine-published `scanned_pairs` bypass the network entirely) | **ALL OK** (108 checks, S8: 13, S9: 8, S10: 6, S11: 13, S12: 27, S13: 13, S14: 3, S15: 6) |
+| Failure scenarios | `npm run test:scenarios` | Offline battery S1–S16 (incl. S6 order-routing `reduce_only` contract, S7 multi-assets balance seed, **S8 the shared exit decision** — ordering, reason labels, gap-aware fills, **S9 active-trade persistence** — flush on change, heartbeat, DB-failure tolerance, **S10 roadmap CLI per-pair thresholds**, **S11 exit attribution** — trades vs legs, net-PnL classification, side-agnostic exits, opposite-side entry matching, inferred flags, numeric streaks, and the window-function-free stats fallback, **S12 engine-log tail contract** — the `lines=` clamp, block-stitching backward scan, partial-record carry, rotation restart, and the `0 ms` clock-offset sentinel on both REST clients, **S13 the soak surface** — the shared `trade_stats` predicate (a short's BUY exit, legs-not-trades, schema probe), the soak card's counts/PnL/last-exit/live soak length, and the watchdog summary agreeing with the card, **S14 the browser check's roadmap re-read**, **S15 the market screener's cache** — a failed (or empty) live fetch is backed off instead of blocking a 4s request in front of every 1 Hz payload build, the last good list keeps being served, and engine-published `scanned_pairs` bypass the network entirely, **S16 the WS + control surface** — a pending `close_all`/`close_symbol` survives `pause`/`resume` so an in-flight emergency close is never dropped, the control read-modify-write is serialized against concurrent POSTs (no lost update), close_symbol dedupe and unknown-action/blank-symbol rejection hold, and concurrent sends to one WebSocket share a per-socket lock so frames never interleave) | **ALL OK** (116 checks, S8: 13, S9: 8, S10: 6, S11: 13, S12: 27, S13: 13, S14: 3, S15: 6, S16: 8) |
 | Futures reconcile | `./venv/bin/python3 ultimate-bot/test_futures_reconcile.py` | Reconcile reads `positionAmt`, not wallet balance | **ALL OK** |
 | Browser render | `npm run test:browser` | Renders the **live page in real headless Chromium** over the Chrome DevTools Protocol (no Playwright/Puppeteer dependency, nothing downloaded) and asserts 15 things about the DOM: 5 desk sections, 5-tab nav, no `NaN`/`undefined`/`Infinity` canaries, no uncaught JS exception, every request succeeded, and the Capital Roadmap card **laid out and visible** with a chip per pair whose threshold matches the served `roadmap.pairs[].required_equity` — so a chip regressing to a literal fails. Needs a running monitor *and* a browser; prints `SKIP` and exits 0 without either (`--strict` makes a skip a failure) | **BROWSER_OK** (15/15) / SKIP |
 | Dashboard UI | `npm run test:ui` | 33 SSR tests: 6 desk sections, bracket ladder, breaker, cooldown, flat state, engine stats, screener empty state, untracked PnL, futures chip, **stale-position flag**, **loop-heartbeat source**, **pause acknowledgement**, **roadmap universe label**, **blocked-pair thresholds**, **newest-first trade table**, **engine trade count in the header**, **inferred-reason marking**, **engine-published process state**, **published loop cadence**, **streak-cooldown chip**, **shared freshness budget**, **engine-log line identity** (the engine's own clock, repeats not collapsed, an 80-char prefix not conflated, FIFO eviction, tracebacks kept), **multi-line rendering**, **app shell (5 tabs)**, tab bodies | **33/33** |
@@ -843,6 +843,17 @@ Re-audited on 2026-09-22 (every tracked file, every function, both languages).
   published no `scanned_pairs`. Fixed with an attempt-time gate plus a 60s failure backoff; guarded
   by `test_scenarios.py` **S15**, every check mutation-verified. See the changelog entry for
   2026-09-25 (11).
+- **The control channel cannot drop an emergency close, and the WS send path is frame-safe.** Two
+  defects in the `/api/control` POST path and the WebSocket send lifecycle: `pause`/`resume` popped
+  a **pending** `close_all`/`close_symbol` from the control file (the engine keeps a close pending
+  until rejected exits succeed, so pausing mid-liquidation erased the operator's emergency close);
+  and the control read-modify-write ran unsynchronized under a one-thread-per-connection server, so
+  two concurrent POSTs could clobber each other. In the WS layer, the pusher thread and the
+  per-client thread both wrote the same socket with bare `sendall()`, so a status/log frame could
+  interleave a pong/keepalive frame. Fixed with a lock around the whole control transaction, a
+  close-preserving `pause`/`resume`, and a per-socket send lock (`_ws_sock_send`). Guarded by
+  `test_scenarios.py` **S16**, every check mutation-verified. See the changelog entry for
+  2026-09-26 (12).
 - **No config drift:** `.env` and `.env.example` share all **90 keys with zero drift** (the
   only differences are the three credential keys, which keep placeholders). Nine keys
 disagreed before the 2026-09-22 reconciliation recorded in the changelog.
@@ -915,6 +926,33 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 Newest first. Entries marked **⚙️ engine** carry deeper detail in
 [ultimate-bot/README.md](./ultimate-bot/README.md).
+
+### 2026-09-26 (12) — WS + control audit: pause could drop an emergency close ⚙️
+
+**Two defects in `status.py`'s WebSocket send lifecycle and its `/api/control` POST path.**
+
+- **`/api/control` `pause`/`resume` silently dropped a pending close command.** The handler popped
+  `command_id`, `close_all` **and** `close_symbol` from the control file. But the engine keeps a
+  close command pending — and retries rejected exits — until every requested position is actually
+  closed (`trade_logic._process_control_commands`). So an operator who hit *Pause* while a
+  `close_all` was mid-liquidation (an exit rejected, retrying next loop) had the emergency close
+  erased on the next write: the engine's mtime-triggered re-read saw no close, and the position
+  was abandoned. The `/api/config` push path already documents that it deliberately leaves the
+  control file untouched for exactly this reason; pause was the inconsistent path. Only a **stale**
+  `command_id` (no close pending) is cleared now.
+- **The control read-modify-write was unsynchronized.** `ThreadingHTTPServer` runs one thread per
+  connection, so two concurrent POSTs (two operators, a click racing a retry) could both read the
+  same control dict and the second write clobbered the first — e.g. a `pause` and a `close_all`
+  arriving together left only one of them. The whole read → mutate → write now runs under a lock.
+- **The pusher thread and the per-client thread both wrote the same socket with bare `sendall()`.**
+  The pusher broadcasts status snapshots (1 Hz) and log tails while the client thread answers
+  app-level pings, keepalives and the close handshake — two concurrent `sendall()` calls can
+  interleave partial frames and corrupt the stream. Every write now goes through `_ws_sock_send`,
+  which serializes on a **per-socket** lock, so a slow client never blocks the others or the pusher.
+- Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (116) ·
+  browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys). New `test_scenarios.py` **S16** (8 checks),
+  each mutation-verified: restoring the close-drop fails 3; neutering the control lock fails the
+  concurrency check; removing the WS send lock fails both interleave checks.
 
 ### 2026-09-25 (11) — Screener cache: a dead ticker endpoint stalled the 1 Hz payload path 🔁
 

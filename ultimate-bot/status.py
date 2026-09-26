@@ -105,6 +105,13 @@ _ws_status_cache = {
     "ts": 0.0,
 }  # 1s coalescing cache for broadcasts
 _ws_stop = threading.Event()
+# Per-socket send locks. The pusher thread broadcasts status/log frames while
+# the client thread answers app-level pings, keepalives and close handshakes on
+# the SAME socket, and ThreadingHTTPServer has no shared write queue: two
+# concurrent sendall() calls can interleave partial frames and corrupt the
+# stream. Every write to a client goes through _ws_sock_send().
+_ws_send_locks = {}
+_ws_send_locks_lock = threading.Lock()
 
 
 def find_env_path(hint=None):
@@ -631,6 +638,101 @@ def write_control(control_path, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, control_path)
+
+
+# /api/control is the only writer of the control file, and ThreadingHTTPServer
+# runs one thread per connection: two operators (or a retry racing a click) can
+# interleave a read-modify-write and lose one another's command. Serialize the
+# whole read → mutate → write here.
+_CONTROL_LOCK = threading.Lock()
+
+
+def apply_control_action(control_path, body):
+    """Apply one `/api/control` request. Returns (http_status, payload).
+
+    Read-modify-write under `_CONTROL_LOCK`, so concurrent POSTs cannot clobber
+    each other. Idempotency: a repeated `command_id` is a no-op, and a repeated
+    `close_symbol` re-uses the pending command instead of stacking a second one
+    that would race the first.
+    """
+    with _CONTROL_LOCK:
+        action = body.get("action")
+        existing_cmd_id = body.get("command_id")
+        existing_control = read_control(control_path)
+        if (
+            existing_cmd_id
+            and existing_control.get("command_id") == existing_cmd_id
+        ):
+            public_control = {
+                k: v
+                for k, v in existing_control.items()
+                if k != "command_id"
+            }
+            return 200, {
+                "ok": True,
+                "action": action,
+                "control": public_control,
+                "duplicate": True,
+            }
+        control = dict(existing_control)
+        if action == "pause":
+            control["paused"] = True
+            control["pause_reason"] = body.get(
+                "reason", "paused from web monitor"
+            )
+        elif action == "resume":
+            control["paused"] = False
+            control.pop("pause_reason", None)
+        elif action == "close_all":
+            control["close_all"] = True
+            control["command_id"] = str(uuid.uuid4())
+        elif action == "close_symbol":
+            symbol = str(body.get("symbol", "")).strip().upper()
+            if not symbol:
+                return 400, {
+                    "ok": False,
+                    "message": "symbol is required for close_symbol",
+                }
+            # If a close_symbol is already pending for the same symbol, re-use it
+            # rather than writing a second command that races the first.
+            pending = control.get("close_symbol", "")
+            if (
+                pending
+                and str(pending).strip().upper() == symbol
+                and not body.get("force")
+            ):
+                public_control = {
+                    k: v for k, v in control.items() if k != "command_id"
+                }
+                return 200, {
+                    "ok": True,
+                    "action": action,
+                    "control": public_control,
+                    "duplicate": True,
+                }
+            control["close_symbol"] = symbol
+            control["command_id"] = str(uuid.uuid4())
+        else:
+            return 400, {"ok": False, "message": f"Unknown action: {action}"}
+
+        # pause/resume must NOT drop a pending close command. The engine keeps
+        # close_all/close_symbol pending — and retries rejected exits — until
+        # every requested position is actually closed (see
+        # trade_logic._process_control_commands), so clearing them here would
+        # silently abandon an operator's emergency liquidation. Only a stale
+        # command_id left behind by an already-resolved close is cleared (and
+        # the engine clears even that itself).
+        if action in ("pause", "resume"):
+            if not control.get("close_all") and not control.get(
+                "close_symbol"
+            ):
+                control.pop("command_id", None)
+
+        write_control(control_path, control)
+        public_control = {
+            k: v for k, v in control.items() if k != "command_id"
+        }
+        return 200, {"ok": True, "action": action, "control": public_control}
 
 
 def parse_env_payload(payload):
@@ -1370,12 +1472,12 @@ def _ws_recv_message(sock):
 
         if frame_op == 0x8:  # close
             try:
-                sock.sendall(_ws_encode_frame(data[:2], opcode=0x8))
+                _ws_sock_send(sock, _ws_encode_frame(data[:2], opcode=0x8))
             except OSError:
                 pass
             raise ConnectionError("peer closed")
         if frame_op == 0x9:  # ping → pong (RFC 6455 §5.5.2)
-            sock.sendall(_ws_encode_frame(data, opcode=0xA))
+            _ws_sock_send(sock, _ws_encode_frame(data, opcode=0xA))
             continue
         if frame_op == 0xA:  # unsolicited pong — ignore
             continue
@@ -1386,17 +1488,32 @@ def _ws_recv_message(sock):
             return opcode, message
 
 
+def _ws_sock_send(sock, frame):
+    """Write one complete frame under the socket's own send lock so the pusher
+    thread and the client thread can never interleave partial frames."""
+    with _ws_send_locks_lock:
+        lock = _ws_send_locks.get(id(sock))
+        if lock is None:
+            lock = threading.Lock()
+            _ws_send_locks[id(sock)] = lock
+    with lock:
+        sock.sendall(frame)
+
+
 def _ws_send_json(sock, obj):
-    sock.sendall(
+    _ws_sock_send(
+        sock,
         _ws_encode_frame(
             json.dumps(obj, default=str).encode("utf-8"), opcode=0x1
-        )
+        ),
     )
 
 
 def _ws_drop_client(sock):
     with _ws_clients_lock:
         _ws_clients.discard(sock)
+    with _ws_send_locks_lock:
+        _ws_send_locks.pop(id(sock), None)
     try:
         sock.close()
     except OSError:
@@ -1422,7 +1539,7 @@ def _ws_broadcast(snapshot_json):
         targets = list(_ws_clients)
     for sock in targets:
         try:
-            sock.sendall(frame)
+            _ws_sock_send(sock, frame)
         except OSError:
             _ws_drop_client(sock)
 
@@ -1476,7 +1593,7 @@ def _ws_periodic_pusher(env_config, db_path, log_path):
                         targets = list(_ws_clients)
                     for sock in targets:
                         try:
-                            sock.sendall(frame)
+                            _ws_sock_send(sock, frame)
                         except OSError:
                             _ws_drop_client(sock)
         except Exception:
@@ -1493,7 +1610,7 @@ def _ws_client_thread(sock, env_config, db_path, log_path):
             {"type": "hello", "server_time": datetime.now().isoformat()},
             default=str,
         ).encode("utf-8")
-        sock.sendall(_ws_encode_frame(hello, opcode=0x1))
+        _ws_sock_send(sock, _ws_encode_frame(hello, opcode=0x1))
         # Initial snapshot so the dashboard paints without waiting a tick.
         try:
             snap = _ws_status_cache.get("json") or json.dumps(
@@ -1502,7 +1619,7 @@ def _ws_client_thread(sock, env_config, db_path, log_path):
         except Exception:
             snap = None
         if snap:
-            sock.sendall(_ws_encode_frame(snap.encode("utf-8"), opcode=0x1))
+            _ws_sock_send(sock, _ws_encode_frame(snap.encode("utf-8"), opcode=0x1))
         while True:
             try:
                 opcode, payload = _ws_recv_message(sock)
@@ -1519,7 +1636,7 @@ def _ws_client_thread(sock, env_config, db_path, log_path):
                         )
             except socket.timeout:
                 # Idle keepalive: prove the link is alive; drop on failure.
-                sock.sendall(_ws_encode_frame(b"", opcode=0x9))
+                _ws_sock_send(sock, _ws_encode_frame(b"", opcode=0x9))
             except ConnectionError:
                 break
     except (ConnectionError, OSError):
@@ -3519,96 +3636,11 @@ def start_web_server(port, env_config, db_path):
                 control_path = env_config.get(
                     "CONTROL_FILE", "./data/engine_control.json"
                 )
-                # Idempotency: if the caller re-posts the same action+identifier we treat
-                # it as a no-op rather than stacking duplicate close_all/close_symbol
-                # commands (each would generate a new command_id and compete).
-                action = body.get("action")
-                existing_cmd_id = body.get("command_id")
-                existing_control = read_control(control_path)
-                if (
-                    existing_cmd_id
-                    and existing_control.get("command_id") == existing_cmd_id
-                ):
-                    public_control = {
-                        k: v
-                        for k, v in existing_control.items()
-                        if k != "command_id"
-                    }
-                    self._send_json(
-                        {
-                            "ok": True,
-                            "action": action,
-                            "control": public_control,
-                            "duplicate": True,
-                        }
-                    )
-                    return
-                control = dict(existing_control)
-                if action == "pause":
-                    control["paused"] = True
-                    control["pause_reason"] = body.get(
-                        "reason", "paused from web monitor"
-                    )
-                elif action == "resume":
-                    control["paused"] = False
-                    control.pop("pause_reason", None)
-                elif action == "close_all":
-                    control["close_all"] = True
-                    control["command_id"] = str(uuid.uuid4())
-                elif action == "close_symbol":
-                    symbol = str(body.get("symbol", "")).strip().upper()
-                    if not symbol:
-                        self._send_json(
-                            {
-                                "ok": False,
-                                "message": "symbol is required for close_symbol",
-                            },
-                            status=400,
-                        )
-                        return
-                    # If a close_symbol is already pending for the same symbol, re-use it
-                    # rather than writing a second command that races the first.
-                    pending = control.get("close_symbol", "")
-                    if (
-                        pending
-                        and str(pending).strip().upper() == symbol
-                        and not body.get("force")
-                    ):
-                        public_control = {
-                            k: v
-                            for k, v in control.items()
-                            if k != "command_id"
-                        }
-                        self._send_json(
-                            {
-                                "ok": True,
-                                "action": action,
-                                "control": public_control,
-                                "duplicate": True,
-                            }
-                        )
-                        return
-                    control["close_symbol"] = symbol
-                    control["command_id"] = str(uuid.uuid4())
-                else:
-                    self._send_json(
-                        {"ok": False, "message": f"Unknown action: {action}"},
-                        status=400,
-                    )
-                    return
-                # Clear any stale command_id that belonged to a now-resolved request so a
-                # new request can get a fresh identifier.
-                if action in ("pause", "resume"):
-                    control.pop("command_id", None)
-                    control.pop("close_all", None)
-                    control.pop("close_symbol", None)
-                write_control(control_path, control)
-                public_control = {
-                    k: v for k, v in control.items() if k != "command_id"
-                }
-                self._send_json(
-                    {"ok": True, "action": action, "control": public_control}
-                )
+                # All read-modify-write + idempotency logic lives in
+                # apply_control_action so it is serialized under a lock and
+                # directly unit-testable (S16).
+                status_code, payload = apply_control_action(control_path, body)
+                self._send_json(payload, status=status_code)
                 return
 
             if clean_path == "/api/soak":

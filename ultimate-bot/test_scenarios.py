@@ -981,6 +981,227 @@ finally:
     _st15.urllib.request.urlopen = _s15_real_urlopen
     _st15._scanned_cache.update(_s15_saved_cache)
 
+# --- S16: /api/control — pending close commands survive pause, and the
+# read-modify-write is serialized; plus the WS send path serializes frames.
+#
+# Two defects this guards:
+#  * pause/resume POPPED close_all/close_symbol from the control file. The
+#    engine keeps a close command pending (and retries rejected exits) until
+#    every requested position is actually closed, so pausing while a
+#    liquidation was in flight silently DROPPED the operator's emergency close.
+#    (The /api/config push path documents that it deliberately preserves the
+#    control file for exactly this reason; pause was the inconsistent path.)
+#  * The read-modify-write was unsynchronized and ThreadingHTTPServer runs one
+#    thread per connection, so two concurrent POSTs could clobber each other.
+#  * The pusher thread and the per-client thread both wrote the same socket
+#    with bare sendall(), so a status/log frame could interleave a pong/close
+#    frame and corrupt the WebSocket stream.
+import tempfile, threading, struct, json as _s16_json
+import status as _st16
+
+_s16_dir = tempfile.mkdtemp(prefix="s16-")
+_s16_ctl = os.path.join(_s16_dir, "engine_control.json")
+
+
+def _s16_seed(data):
+    with open(_s16_ctl, "w", encoding="utf-8") as f:
+        _s16_json.dump(data, f)
+
+
+# 1. A pending close_all survives a pause, command_id intact (the engine needs
+#    the id to keep deduping its retry).
+def _s16_control_tests():
+    _s16_seed({"close_all": True, "command_id": "cid-close"})
+    code, out = _st16.apply_control_action(_s16_ctl, {"action": "pause"})
+    saved = _st16.read_control(_s16_ctl)
+    check(
+        "S16 pause preserves a pending close_all (emergency close not dropped)",
+        code == 200 and saved.get("close_all") is True
+        and saved.get("command_id") == "cid-close"
+        and saved.get("paused") is True,
+        f"saved={saved}",
+    )
+
+    # 2. Same for a pending single-symbol close.
+    _s16_seed({"close_symbol": "BTCUSDT", "command_id": "cid-sym"})
+    code, out = _st16.apply_control_action(_s16_ctl, {"action": "resume"})
+    saved = _st16.read_control(_s16_ctl)
+    check(
+        "S16 resume preserves a pending close_symbol",
+        saved.get("close_symbol") == "BTCUSDT"
+        and saved.get("command_id") == "cid-sym"
+        and saved.get("paused") is False,
+        f"saved={saved}",
+    )
+
+    # 3. With NO close pending, a stale command_id is cleared (the old intent).
+    _s16_seed({"command_id": "stale", "paused": False})
+    _st16.apply_control_action(_s16_ctl, {"action": "pause"})
+    saved = _st16.read_control(_s16_ctl)
+    check(
+        "S16 pause clears a stale command_id when no close is pending",
+        "command_id" not in saved and saved.get("paused") is True,
+        f"saved={saved}",
+    )
+
+    # 4. Concurrent pause + close_all are serialized: BOTH survive. Without the
+    #    lock the two read-modify-writes clobber each other (one flag is lost).
+    _s16_seed({})
+    real_read = _st16.read_control
+
+    def _slow_read(path):
+        time.sleep(0.03)  # hold the read-modify window open
+        return real_read(path)
+
+    _st16.read_control = _slow_read
+    try:
+        gate = threading.Barrier(2)
+
+        def _post(action):
+            gate.wait()
+            _st16.apply_control_action(_s16_ctl, action)
+
+        th = [
+            threading.Thread(target=_post, args=({"action": "pause"},)),
+            threading.Thread(target=_post, args=({"action": "close_all"},)),
+        ]
+        for t in th:
+            t.start()
+        for t in th:
+            t.join(timeout=5)
+        saved = _st16.read_control(_s16_ctl)
+        check(
+            "S16 concurrent pause + close_all both persist (no lost update)",
+            saved.get("paused") is True and saved.get("close_all") is True,
+            f"saved={saved}",
+        )
+    finally:
+        _st16.read_control = real_read
+
+    # 5. close_symbol dedupe still re-uses the pending command (unchanged).
+    _s16_seed({"close_symbol": "ETHUSDT", "command_id": "cid-eth"})
+    code, out = _st16.apply_control_action(
+        _s16_ctl, {"action": "close_symbol", "symbol": "ethusdt"}
+    )
+    saved = _st16.read_control(_s16_ctl)
+    check(
+        "S16 repeated close_symbol re-uses the pending command (duplicate)",
+        out.get("duplicate") is True and saved.get("command_id") == "cid-eth",
+        f"out={out} saved={saved}",
+    )
+
+    # 6. Unknown action / missing symbol are rejected with 400.
+    code_bad, _ = _st16.apply_control_action(_s16_ctl, {"action": "nope"})
+    code_sym, _ = _st16.apply_control_action(
+        _s16_ctl, {"action": "close_symbol", "symbol": "  "}
+    )
+    check(
+        "S16 unknown action and blank symbol are rejected",
+        code_bad == 400 and code_sym == 400,
+        f"unknown={code_bad} blank_symbol={code_sym}",
+    )
+
+
+def _s16_ws_tests():
+    # --- 7/8. WS send serialization (independent of the control file). ---
+    class _S16Sock:
+        """sendall() stand-in that flags concurrent entry."""
+
+        def __init__(self):
+            self.active = 0
+            self.overlap = 0
+            self.buf = b""
+
+        def sendall(self, data):
+            self.active += 1
+            if self.active > 1:
+                self.overlap += 1
+            time.sleep(0.01)
+            self.buf += data
+            self.active -= 1
+
+    def _s16_frames(buf):
+        out = []
+        i = 0
+        while i < len(buf):
+            b1, b2 = buf[i], buf[i + 1]
+            ln = b2 & 0x7F
+            j = i + 2
+            if ln == 126:
+                ln = struct.unpack(">H", buf[j:j + 2])[0]
+                j += 2
+            elif ln == 127:
+                ln = struct.unpack(">Q", buf[j:j + 8])[0]
+                j += 8
+            out.append(buf[j:j + ln])
+            i = j + ln
+        return out
+
+    sock = _S16Sock()
+    n = 8
+    gate = threading.Barrier(n)
+
+    def _writer(k):
+        gate.wait()
+        _st16._ws_send_json(sock, {"n": k})
+
+    ths = [threading.Thread(target=_writer, args=(k,)) for k in range(n)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=5)
+    frames = _s16_frames(sock.buf)
+    parsed = []
+    for fr in frames:
+        try:
+            parsed.append(_s16_json.loads(fr.decode("utf-8")))
+        except Exception:
+            parsed.append(None)
+    check(
+        "S16 concurrent WS sends to one socket never interleave",
+        sock.overlap == 0 and len(parsed) == n
+        and all(isinstance(p, dict) and "n" in p for p in parsed),
+        f"overlap={sock.overlap} frames={len(parsed)}",
+    )
+
+    # 8. The broadcast path (pusher) shares the same per-socket lock as the
+    #    client thread's direct sends — mixing them must still not interleave.
+    sock2 = _S16Sock()
+    with _st16._ws_clients_lock:
+        _st16._ws_clients.add(sock2)
+    try:
+        gate2 = threading.Barrier(2)
+
+        def _bcast():
+            gate2.wait()
+            _st16._ws_broadcast('{"type": "status"}')
+
+        def _direct():
+            gate2.wait()
+            _st16._ws_send_json(sock2, {"type": "pong"})
+
+        ts = [threading.Thread(target=_bcast), threading.Thread(target=_direct)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(timeout=5)
+        check(
+            "S16 broadcast and a direct reply share the same send lock",
+            sock2.overlap == 0 and len(_s16_frames(sock2.buf)) == 2,
+            f"overlap={sock2.overlap} frames={len(_s16_frames(sock2.buf))}",
+        )
+    finally:
+        with _st16._ws_clients_lock:
+            _st16._ws_clients.discard(sock2)
+        with _st16._ws_send_locks_lock:
+            _st16._ws_send_locks.pop(id(sock2), None)
+        with _st16._ws_send_locks_lock:
+            _st16._ws_send_locks.pop(id(sock), None)
+
+
+_s16_control_tests()
+_s16_ws_tests()
+
 print()
 print("ALL_OK" if not FAILS else f"FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)
