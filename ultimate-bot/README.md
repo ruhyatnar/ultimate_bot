@@ -26,6 +26,37 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 
 ## 📝 Changelog
 
+### 2026-09-26 (16) — Futures profitability: reverted the deployed strategy overrides to the proven preset
+
+**A futures backtest sweep found the deployed `.env` was overriding the validated `intraday_rsi`
+preset on eight strategy keys, and the overrides were net-negative on futures in every window tested.**
+`backtest.py --market futures` replays real fapi klines through the live `trade_policy.evaluate_exit`
+core with 0.05%/leg taker fees, historical 8h funding and the real per-symbol 5 USDT notional floor.
+
+- **Deployed vs preset-aligned** (6 pairs, 30 pages): deployed mean **−4.83%** (NEAR −8.9%, ADA −15.0%)
+  vs preset-aligned **+0.68%** — better on 5/6 pairs.
+- **Knob sweep** (3 pairs, 20 pages): preset base mean **+3.36%**; `RSI_TIMEFRAME=30m` alone (the
+  deployed value) drove mean to **−0.68%** and worst to **−12.2%**. `SL`/`TP` overrides were inert
+  (the ATR stop dominates); `TRAILING_STOP_ACTIVATE=0.005` was marginally better but not robust.
+- **Sub-windows:** preset-aligned beat deployed **6/6**.
+- **Funding was negligible**; the loss was overtrading + wrong RSI bucket/period + 4h regime.
+
+Applied to `.env` (mirrored to `.env.example`): `RSI_TIMEFRAME` 30m→1h, `RSI_TIMEFRAME_MS`
+1800000→3600000, `RSI_PERIOD` 14→7, `REGIME_SLOPE_DAYS` 2→3, `MTF_TIMEFRAME` 4h→1d,
+`MAX_TRADES_PER_DAY` 0→2, `BREAKEVEN_ENABLED` true→false, `CLOSE_AT_UTC_DAY_END` false→true. Engine
+reloaded via PM2, online with no config errors. Caveat: this restores the designed-for config and
+flips futures expectancy to roughly break-even-to-positive; the long-only strategy's bigger lever
+(shorting) is an unbuilt code change.
+
+**Post-apply battery** (new config, 6-pair basket, 20 pages, $22, futures): T0 (latest) mean **+2.30%**
+(5/6 positive), T1 (−60d) **−0.78%**, T2 (−120d) **−0.55%** — the daily-EMA50 gate keeps it flat in
+downtrends, so it is break-even-to-positive overall and best in the current window, not uniformly
+profitable. `SL`/`TP` neighborhood is inert (ATR stop dominates); `backtest.py` has no slippage knob,
+so the documented 0/5/10 bps stress could not be run.
+
+Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (133) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys).
+
 ### 2026-09-26 (15) — Config-push audit: concurrent pushes could drop keys, and invalid ones vanished
 
 **`POST /api/config` — the whitelisted tuning push — was audited.** Two silent-loss defects.

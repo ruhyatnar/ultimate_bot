@@ -902,36 +902,15 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 **Watch these**
 
-1. **The deployed config overrides the `intraday_rsi` preset on 8 strategy keys — and it is now
-   measurable.** The preset is what §4 documents and what the provenance battery validated, but the
-   live `.env` wins wherever it sets a key — and it sets these eight:
-
-   | Key | Preset (validated) | Live `.env` |
-   |---|---|---|
-   | `RSI_TIMEFRAME` | `1h` | `30m` |
-   | `RSI_PERIOD` | `7` | `14` |
-   | `REGIME_EMA` | `50` | `21` |
-   | `REGIME_SLOPE_DAYS` | `3` | `2` |
-   | `MTF_TIMEFRAME` | `1d` | `4h` |
-   | `MAX_TRADES_PER_DAY` | `2` | `0` (unlimited) |
-   | `BREAKEVEN_ENABLED` | `false` | `true` |
-   | `CLOSE_AT_UTC_DAY_END` | `true` | `false` |
-
-   These may be deliberate operator choices — the engine is the one trading — but they mean the
-   running strategy is **not** the configuration behind +10.77% / PF 1.43. Since the audit fixed the
-   backtest's config resolution, the two can be compared on an **identical window** (NEARUSDT, 30 pages
-   ≈ 104 days, $22 equity, run 2026-09-22):
-
-   | Config | Return | Trades | WR | PF | Expectancy | Fees | Max DD |
-   |---|---|---|---|---|---|---|---|
-   | Preset (validated values) | **+0.41%** | 56 | 52% | **1.02** | +0.07 | 92.6 | 7.6% |
-   | Deployed `.env` | **−7.80%** | 58 | 55% | **0.73** | −1.34 | 90.7 | 10.3% |
-
-   Same window, same fee model, same signal code: the deployed overrides are worth roughly **8 points
-   of return and 0.29 of profit factor**. Neither figure is the historic +10.77% — the preset itself has
-   degraded on recent data — but the deployed config is the weaker of the two, and it is the one trading.
-   Re-tune or revert only against a fresh backtest (GO_LIVE.md step 5.3): a 15m `RSI_TIMEFRAME` was
-   already measured turning the validated +7.11% into −16.5% through fee drag.
+1. **The deployed config used to override the `intraday_rsi` preset on 8 strategy keys — RESOLVED
+   2026-09-26 (16).** The live `.env` wrong-won wherever it set a key; those eight keys
+   (`RSI_TIMEFRAME` `30m`, `RSI_PERIOD` `14`, `REGIME_SLOPE_DAYS` `2`, `MTF_TIMEFRAME` `4h`,
+   `MAX_TRADES_PER_DAY` `0`, `BREAKEVEN_ENABLED` `true`, `CLOSE_AT_UTC_DAY_END` `false`,
+   `RSI_TIMEFRAME_MS` `1800000`) were reverted to the validated preset values after a futures
+   backtest sweep showed them strictly harmful. See the changelog entry for 2026-09-26 (16) for the
+   evidence (preset-aligned beat deployed in **6/6** symbol×window comparisons; futures expectancy
+   flipped from negative to roughly break-even-to-positive). The preset is what §4 documents and what
+   the provenance battery validated, and it is again what trades.
 2. **Backtest↔live parity: the exit decision is now literally shared.** Fixed 2026-09-22/23 — the
    backtest resolves config **env-first** exactly like `config.load_config()` (verified at zero
    differences across every non-credential key), it applies the `FUNDING_RATE_MAX` **entry gate** so a
@@ -956,6 +935,45 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 Newest first. Entries marked **⚙️ engine** carry deeper detail in
 [ultimate-bot/README.md](./ultimate-bot/README.md).
+
+### 2026-09-26 (16) — Futures profitability: the deployed strategy overrides were losing money 💹
+
+**A futures backtest sweep (`backtest.py --market futures` — real fapi klines, 0.05%/leg taker fees,
+historical funding, real 5 USDT notional floor) found the deployed `.env` was overriding the validated
+`intraday_rsi` preset on eight strategy keys, and those overrides were net-negative on futures across
+every window tested.**
+
+- **Phase 1** (6 pairs, 30 pages): deployed mean **−4.83%** (NEAR −8.9%, ADA −15.0%); preset-aligned
+  **+0.68%**, better on 5/6 pairs.
+- **Phase 2** (3 pairs, 20 pages): the preset base returned mean **+3.36%**; the single deployed
+  `RSI_TIMEFRAME=30m` value alone dragged the mean to **−0.68%** and the worst pair to **−12.2%**
+  (42 trades vs 15–22). Bracket knobs (`SL`/`TP`) were inert — the ATR stop dominates.
+- **Phase 3** (sub-windows): preset-aligned beat the deployed config in **6/6** symbol×window
+  comparisons.
+- **Funding was negligible** (~0.005 USDT/window). The damage was overtrading (`MAX_TRADES_PER_DAY=0`)
+  plus the 30m RSI bucket, `RSI_PERIOD=14` and the 4h regime — not futures cost drag.
+
+**Change applied** to `.env` (mirrored into `.env.example`, 90 keys IN SYNC) — exactly the backtested
+set: `RSI_TIMEFRAME` 30m→1h, `RSI_TIMEFRAME_MS` 1800000→3600000, `RSI_PERIOD` 14→7,
+`REGIME_SLOPE_DAYS` 2→3, `MTF_TIMEFRAME` 4h→1d, `MAX_TRADES_PER_DAY` 0→2, `BREAKEVEN_ENABLED`
+true→false, `CLOSE_AT_UTC_DAY_END` false→true. Engine reloaded via PM2 — online, no config errors,
+new values served by `/api/status`.
+
+**Post-apply battery** (new config, 6-pair basket, 20 pages, $22, futures): **T0 (latest) mean +2.30%**
+(5/6 positive; ARB +10.9, LINK −1.2); **T1 (−60d) mean −0.78%** (several pairs 0 trades — the daily-EMA50
+regime gate keeps it flat in downtrends); **T2 (−120d) mean −0.55%**. GO_LIVE §5.3 (NEARUSDT, 30 pages,
+$1000 equity): **+0.26%**, PF 1.04, DD 5.9%. So the alignment removes the deployed config's large
+losses and is break-even-to-positive, best in the current regime — it is **not** uniformly profitable
+in every sub-window. Funding stayed negligible; the `SL`/`TP` neighborhood is inert under the ATR stop;
+and `backtest.py` has no slippage knob, so the documented 0/5/10 bps stress could not be reproduced.
+
+**Honest caveat:** this reverts to the config the engine was designed around and flips futures
+expectancy from negative to roughly break-even-to-positive — it is not a high-return guarantee. The
+strategy is **long-only**; the largest untapped futures lever (shorting downtrends) is a code change,
+not a config tweak, and remains unbuilt.
+
+**Full gate:** `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (133) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys).
 
 ### 2026-09-26 (15) — Config-push audit: concurrent pushes could drop keys, and invalid ones vanished 🔧
 
