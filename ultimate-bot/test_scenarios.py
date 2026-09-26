@@ -1401,6 +1401,129 @@ check(
     _s18_line(out, "NEARUSDT"),
 )
 
+# --- S19: /api/config — the tuning push cannot lose a concurrent write, and it
+# reports values it threw away.
+#  * apply_env_updates is a read-modify-write of the WHOLE .env. ThreadingHTTPServer
+#    runs one thread per connection, so two concurrent pushes each read the
+#    pre-push file and the second write silently dropped the first's keys — the
+#    same lost update the control channel fixed (S16). apply_config_push serializes
+#    the file write together with the monitor's in-memory snapshot update.
+#  * parse_env_payload silently discarded a whitelisted key whose value failed
+#    validation, so a payload with one typo returned ok:true and a count that
+#    omitted it. parse_env_payload_report names the rejected keys.
+#  * the paper->live credential safety check ran AFTER apply_env_updates, so a
+#    REFUSED PAPER_TRADE=false push was still written to .env — the 400 did not
+#    undo the write, and the engine boot-failed on its next restart.
+#    apply_config_push_request checks before it persists.
+import tempfile as _s19_tempfile
+import status as _st19
+
+_s19_dir = _s19_tempfile.mkdtemp(prefix="s19-")
+_s19_env = os.path.join(_s19_dir, ".env")
+
+def _s19_write(text):
+    with open(_s19_env, "w", encoding="utf-8") as f:
+        f.write(text)
+
+_s19_saved_mtime = dict(_st19._ENV_MTIME)
+_s19_real_apply = _st19.apply_env_updates
+try:
+    _s19_write("PRESET=alpha\nMAX_TRADES_PER_DAY=1\n")
+    _s19_cfg = {}
+    _s19_gate = threading.Barrier(2)
+
+    def _s19_slow_apply(env_path, updates):
+        # Widen the read-modify window so an UNLOCKED pair interleaves.
+        time.sleep(0.03)
+        return _s19_real_apply(env_path, updates)
+
+    _st19.apply_env_updates = _s19_slow_apply
+
+    def _s19_push(k, v):
+        _s19_gate.wait()
+        _st19.apply_config_push(_s19_cfg, _s19_env, {k: v})
+
+    ths = [
+        threading.Thread(target=_s19_push, args=("PRESET", "omega")),
+        threading.Thread(target=_s19_push, args=("MAX_TRADES_PER_DAY", "9")),
+    ]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=5)
+    _s19_body = open(_s19_env, encoding="utf-8").read()
+    check(
+        "S19 concurrent config pushes both persist (no lost update)",
+        "PRESET=omega" in _s19_body and "MAX_TRADES_PER_DAY=9" in _s19_body,
+        _s19_body,
+    )
+    check(
+        "S19 the monitor's in-memory snapshot tracks the pushed values",
+        _s19_cfg.get("PRESET") == "omega"
+        and _s19_cfg.get("MAX_TRADES_PER_DAY") == "9",
+        str(_s19_cfg),
+    )
+finally:
+    _st19.apply_env_updates = _s19_real_apply
+    _st19._ENV_MTIME.clear()
+    _st19._ENV_MTIME.update(_s19_saved_mtime)
+
+_updates, _rejected = _st19.parse_env_payload_report(
+    "# comment\nMAX_TRADES_PER_DAY=NaN\nPRESET=beta\n"
+    "BINANCE_API_KEY=should-be-ignored\nNOT_A_KEY=1\n"
+)
+check(
+    "S19 an invalid tunable value is reported, not silently dropped",
+    _updates == {"PRESET": "beta"} and _rejected == ["MAX_TRADES_PER_DAY"],
+    f"updates={_updates} rejected={_rejected}",
+)
+check(
+    "S19 non-tunable lines are ignored, not reported as rejected",
+    "BINANCE_API_KEY" not in _rejected and "NOT_A_KEY" not in _rejected,
+    f"rejected={_rejected}",
+)
+check(
+    "S19 parse_env_payload still returns valid updates only (back-compat)",
+    _st19.parse_env_payload("PRESET=gamma\nSL_PERCENT=nope\n") == {"PRESET": "gamma"},
+)
+
+# 6/7. The paper→live credential check must run BEFORE the write. It used to run
+# after apply_env_updates, so a REFUSED PAPER_TRADE=false push was persisted to
+# .env anyway — the response said 400 but the engine boot-failed on restart.
+_s19_real_find = _st19.find_env_path
+try:
+    _st19.find_env_path = lambda *_a, **_k: _s19_env
+
+    _s19_write("PAPER_TRADE=true\nBINANCE_API_KEY=\nBINANCE_API_SECRET=\n")
+    _s19_noauth = {"PAPER_TRADE": "true", "BINANCE_API_KEY": "", "BINANCE_API_SECRET": ""}
+    _code, _payload = _st19.apply_config_push_request(
+        _s19_noauth, "PAPER_TRADE=false\nMAX_TRADES_PER_DAY=3\n"
+    )
+    _body = open(_s19_env, encoding="utf-8").read()
+    check(
+        "S19 a refused paper→live push is not persisted to .env",
+        _code == 400
+        and "PAPER_TRADE=false" not in _body
+        and _s19_noauth.get("PAPER_TRADE") == "true",
+        f"code={_code} body={_body!r}",
+    )
+
+    _s19_write("PAPER_TRADE=true\nBINANCE_API_KEY=k\nBINANCE_API_SECRET=s\n")
+    _s19_auth = {"PAPER_TRADE": "true", "BINANCE_API_KEY": "k", "BINANCE_API_SECRET": "s"}
+    _code2, _payload2 = _st19.apply_config_push_request(_s19_auth, "PAPER_TRADE=false\n")
+    _body2 = open(_s19_env, encoding="utf-8").read()
+    check(
+        "S19 a paper→live push with valid credentials applies",
+        _code2 == 200
+        and "PAPER_TRADE=false" in _body2
+        and _s19_auth.get("PAPER_TRADE") == "false",
+        f"code={_code2} body={_body2!r}",
+    )
+finally:
+    _st19.find_env_path = _s19_real_find
+    _st19._ENV_MTIME.clear()
+    _st19._ENV_MTIME.update(_s19_saved_mtime)
+
 print()
 print("ALL_OK" if not FAILS else f"FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

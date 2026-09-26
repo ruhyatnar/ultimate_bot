@@ -26,6 +26,29 @@ Engineered for **Debian 13 (Trixie) CLI-only VPS** environments with zero GUI ov
 
 ## 📝 Changelog
 
+### 2026-09-26 (15) — Config-push audit: concurrent pushes could drop keys, and invalid ones vanished
+
+**`POST /api/config` — the whitelisted tuning push — was audited.** Two silent-loss defects.
+
+- **Two concurrent pushes could lose one another's keys.** `apply_env_updates` is a read-modify-write
+  of the whole `.env` and the server is one-thread-per-connection, so two pushes each read the
+  pre-push file and the second write dropped the first's keys — both still answered `ok: true`.
+  `apply_config_push` now serializes the file write and the monitor's in-memory snapshot update under
+  `_CONFIG_LOCK`; `refresh_env_config`'s snapshot mutate takes the same lock.
+- **Invalid values were silently discarded.** `parse_env_payload` dropped any whitelisted key whose
+  value failed validation, so a payload with one typo returned `ok: true` with a count that omitted
+  it. `parse_env_payload_report` now names rejected keys; the endpoint returns a `rejected` array
+  (or a 400 naming them when nothing valid remains), and the dashboard surfaces them.
+- **A refused paper→live push was still persisted.** The credential safety check ran *after*
+  `apply_env_updates`, so a rejected `PAPER_TRADE=false` push had already been written to `.env`
+  (and mirrored in memory) — the 400 did not undo it, and the engine would boot-fail on restart.
+  `apply_config_push_request` now checks before it writes.
+- New `test_scenarios.py` **S19** (7 checks), each mutation-verified against a temp `.env` (no DB, no
+  network).
+
+Verified: `tsc --noEmit` clean, **smoke 13/13 · UI 33/33 · sync 78/78 · scenarios ALL_OK (133) ·
+browser BROWSER_OK**, `.env` ≡ `.env.example` (90 keys, untouched).
+
 ### 2026-09-26 (14) — CLI monitor audit: it named the wrong universe and the wrong venue
 
 **`render_dashboard` — the terminal monitor — was audited against the payload contract the HTTP,
@@ -2454,7 +2477,15 @@ the config list as the pre-publish fallback), a `MARKET=futures` live account la
 (not "Total Spot Equity") with a venue-naming mode tag, and realized order PnL denominated in the
 configured `QUOTE_ASSET`. The checks render against synthetic `db_data` — no network, no DB.
 
-Exit code 0 = `ALL_OK` (126 checks), 1 = at least one failure, which is named.
+**S19 guards the `/api/config` push** — two concurrent pushes must both persist (the `.env`
+read-modify-write and the monitor's in-memory snapshot are serialized under `_CONFIG_LOCK`, so a
+push cannot silently drop a concurrent one's keys), an invalid whitelisted value is named in
+`rejected` instead of being discarded behind an `ok: true`, non-tunable lines are ignored rather
+than reported as rejected, and a refused paper→live push (no credentials) is **not** persisted to
+`.env` (the safety check runs before the write). It applies against a temp `.env` — no DB, no
+network.
+
+Exit code 0 = `ALL_OK` (133 checks), 1 = at least one failure, which is named.
 
 ### Config Drift Check (`check_env_drift.py`)
 

@@ -1027,9 +1027,13 @@ export default function App() {
       const reloadNote = json.reload?.exit_code === 0
         ? 'Engine reloaded via PM2 — changes live now.'
         : (json.reload?.hint || (json.reload?.error ? `Reload note: ${json.reload.error}` : ''));
-      const message = `Applied ${json.count} tunable keys to the engine .env. ${reloadNote}`;
+      const rejected = Array.isArray(json.rejected) && json.rejected.length
+        ? ` ⚠ Ignored invalid value(s) for: ${json.rejected.join(', ')}.`
+        : '';
+      const message = `Applied ${json.count} tunable keys to the engine .env.${rejected} ${reloadNote}`;
       setVpsPushResult({ ok: true, message });
       addLog('SUCCESS', 'SYS', `Engine config pushed: ${(json.applied || []).join(', ')}`);
+      if (rejected) addLog('WARN', 'SYS', `Config keys ignored (invalid value): ${json.rejected.join(', ')}`);
       vpsSocketRef.current?.refresh();
       setTimeout(() => fetchVpsData(), 2500);
       return { ok: true, message };

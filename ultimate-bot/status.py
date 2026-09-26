@@ -192,6 +192,14 @@ def load_env(env_path=None):
 # mtime of the .env last loaded into the monitor's in-memory env_config.
 _ENV_MTIME = {"path": None, "mtime": None}
 
+# Serializes .env WRITES and the monitor's in-memory snapshot mutation. Two
+# writers exist — refresh_env_config (mtime-driven re-read) and the /api/config
+# push — and ThreadingHTTPServer runs one thread per connection, so without this
+# two concurrent pushes would each read the pre-push file and the second write
+# would silently drop the first's keys (the same lost update the control channel
+# fixed). Readers are not locked; only writers are.
+_CONFIG_LOCK = threading.Lock()
+
 # Cached capital-roadmap payload (live exchange data). Reused for 10 min, and
 # recomputed early whenever the engine's watched-pair set changes — the floors
 # belong to those specific symbols, so a rotated watchlist invalidates them.
@@ -434,10 +442,13 @@ def refresh_env_config(env_config, env_path=None):
         return env_config
     fresh = load_env(path)
     if fresh:
-        env_config.clear()
-        env_config.update(fresh)
-        _ENV_MTIME["path"] = key
-        _ENV_MTIME["mtime"] = mtime
+        # Serialize the snapshot mutate against a concurrent push/refresh so two
+        # writers cannot interleave clear()/update() on the shared dict.
+        with _CONFIG_LOCK:
+            env_config.clear()
+            env_config.update(fresh)
+            _ENV_MTIME["path"] = key
+            _ENV_MTIME["mtime"] = mtime
     return env_config
 
 
@@ -735,8 +746,18 @@ def apply_control_action(control_path, body):
         return 200, {"ok": True, "action": action, "control": public_control}
 
 
-def parse_env_payload(payload):
+def parse_env_payload_report(payload):
+    """Parse a pushed .env blob into (updates, rejected).
+
+    `rejected` names WHITELISTED keys whose value failed validation. They used to
+    vanish silently: a payload with one typo returned `ok: true` and a key count
+    that omitted it, so the operator believed a value had been applied when the
+    server had thrown it away. Callers surface `rejected` so a partial push is
+    visible rather than reported as a clean success. Non-tunable lines (the rest
+    of a full .env) are ignored, not "rejected".
+    """
     updates = {}
+    rejected = []
     for line in payload.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -746,9 +767,15 @@ def parse_env_payload(payload):
         if k not in TUNING_KEYS:
             continue
         if not _valid_tuning_value(k, v.strip()):
+            rejected.append(k)
             continue
         updates[k] = v.strip()
-    return updates
+    return updates, rejected
+
+
+def parse_env_payload(payload):
+    """Valid updates only (back-compat wrapper over parse_env_payload_report)."""
+    return parse_env_payload_report(payload)[0]
 
 
 def _valid_tuning_value(key, value):
@@ -836,6 +863,86 @@ def apply_env_updates(env_path, updates):
         os.fsync(f.fileno())
     os.replace(tmp, env_path)
     return applied
+
+
+def apply_config_push(env_config, env_path, updates):
+    """Apply a whitelisted `/api/config` push: write .env and sync the monitor's
+    in-memory snapshot, both under `_CONFIG_LOCK`.
+
+    `apply_env_updates` is a read-modify-write of the whole file. Two concurrent
+    pushes would each read the pre-push file, and the second write would drop the
+    first's keys — a silent lost update. Holding one lock across the file write
+    AND the in-memory update also keeps the served /api/status and /ws payload in
+    lock-step with what was written. Returns the list of keys written.
+    """
+    with _CONFIG_LOCK:
+        applied = apply_env_updates(env_path, updates)
+        for key in applied:
+            if key in updates:
+                env_config[key] = updates[key]
+        try:
+            _ENV_MTIME["path"] = os.path.abspath(env_path)
+            _ENV_MTIME["mtime"] = os.path.getmtime(env_path)
+        except OSError:
+            pass
+        return applied
+
+
+def _has_live_credentials(cfg):
+    """True when `cfg` carries usable Binance auth (API key + secret or a key file)."""
+    api_key = str(cfg.get("BINANCE_API_KEY", "")).strip()
+    api_secret = str(cfg.get("BINANCE_API_SECRET", "")).strip()
+    private_key_path = str(cfg.get("BINANCE_PRIVATE_KEY_PATH", "")).strip()
+    return bool(
+        api_key
+        and (api_secret or (private_key_path and os.path.exists(private_key_path)))
+    )
+
+
+def apply_config_push_request(env_config, raw):
+    """Validate, safety-check and persist one `/api/config` push → (status, payload).
+
+    The paper→live credential check runs BEFORE the write. It used to run after
+    `apply_env_updates`, so a REFUSED `PAPER_TRADE=false` push was still written to
+    `.env` (and mirrored into the monitor's in-memory snapshot) — the response said
+    400, but the engine would then boot-fail on its next restart because the bad
+    value had already been persisted. Refusing without persisting keeps the
+    rejection honest. The engine reload is left to the caller, so the whole
+    transaction is testable without a server (mirrors `apply_control_action`).
+    """
+    updates, rejected = parse_env_payload_report(raw)
+    if not updates:
+        if rejected:
+            message = (
+                "No valid tunable values in payload — rejected: "
+                + ", ".join(sorted(set(rejected)))
+            )
+        else:
+            message = "No whitelisted tunable keys found in payload"
+        return 400, {"ok": False, "message": message}
+
+    if "PAPER_TRADE" in updates and str(updates["PAPER_TRADE"]).lower() != "true":
+        tentative = dict(env_config)
+        tentative.update(updates)
+        if not _has_live_credentials(tentative):
+            return 400, {
+                "ok": False,
+                "message": "Cannot switch PAPER_TRADE=false: no valid BINANCE_API_KEY + secret/key path found in the pushed config.",
+            }
+
+    env_path = find_env_path()
+    # Serialized: two concurrent pushes must not lose one another's keys, and the
+    # monitor's in-memory snapshot is updated atomically with the file.
+    applied = apply_config_push(env_config, env_path, updates)
+
+    payload = {"ok": True, "applied": applied, "count": len(applied)}
+    if rejected:
+        payload["rejected"] = sorted(set(rejected))
+        payload["message"] = (
+            f"Applied {len(applied)} key(s); ignored invalid value(s) "
+            "for: " + ", ".join(sorted(set(rejected)))
+        )
+    return 200, payload
 
 
 # /api/logs tail bounds. The endpoint is unauthenticated, so the size is a
@@ -3778,70 +3885,11 @@ def start_web_server(port, env_config, db_path):
                         status=400,
                     )
                     return
-                updates = parse_env_payload(raw)
-                if not updates:
-                    self._send_json(
-                        {
-                            "ok": False,
-                            "message": "No whitelisted tunable keys found in payload",
-                        },
-                        status=400,
-                    )
+                status_code, result = apply_config_push_request(env_config, raw)
+                if status_code != 200:
+                    self._send_json(result, status=status_code)
                     return
-                env_path = find_env_path()
-                applied = apply_env_updates(env_path, updates)
-
-                # Keep the monitor's in-memory view of .env in lock-step with what
-                # was just written, so /api/status and the /ws push serve the new
-                # values immediately instead of the pre-push startup snapshot.
-                for _k in applied:
-                    if _k in updates:
-                        env_config[_k] = updates[_k]
-                try:
-                    _ENV_MTIME["path"] = os.path.abspath(env_path)
-                    _ENV_MTIME["mtime"] = os.path.getmtime(env_path)
-                except OSError:
-                    pass
-
-                # Safety: if the pushed config would switch the engine from paper to live
-                # trading without valid auth credentials, abort the push so a PM2 reload
-                # cannot leave the engine in a boot-failure state.
-                if "PAPER_TRADE" in updates:
-                    new_paper = str(updates["PAPER_TRADE"]).lower() == "true"
-                    if not new_paper:
-                        tentative = dict(env_config)
-                        tentative.update(updates)
-                        api_key = str(
-                            tentative.get("BINANCE_API_KEY", "")
-                        ).strip()
-                        api_secret = str(
-                            tentative.get("BINANCE_API_SECRET", "")
-                        ).strip()
-                        private_key_path = str(
-                            tentative.get("BINANCE_PRIVATE_KEY_PATH", "")
-                        ).strip()
-                        has_auth = bool(
-                            api_key
-                            and (
-                                api_secret
-                                or (
-                                    private_key_path
-                                    and os.path.exists(private_key_path)
-                                )
-                            )
-                        )
-                        if not has_auth:
-                            self._send_json(
-                                {
-                                    "ok": False,
-                                    "message": "Cannot switch PAPER_TRADE=false: no valid BINANCE_API_KEY + secret/key path found in the pushed config.",
-                                },
-                                status=400,
-                            )
-                            return
-
-                result = {"ok": True, "applied": applied, "count": len(applied)}
-                if applied and shutil.which("pm2"):
+                if result["applied"] and shutil.which("pm2"):
                     try:
                         proc = subprocess.run(
                             ["pm2", "reload", "ultimate-bot"],
