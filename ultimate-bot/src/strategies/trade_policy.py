@@ -46,14 +46,22 @@ def _fnum(value, default=0.0):
     return out if out == out and abs(out) != float("inf") else default
 
 
-def effective_bracket(entry_price, config, atr=None):
-    """Return the bullish bracket ``(stop_price, take_profit)``.
+def effective_bracket(entry_price, config, atr=None, side="long"):
+    """Return the bracket ``(stop_price, take_profit)`` for ``side``.
+
+    Long (default): the stop is BELOW entry and the take-profit ABOVE it, sized
+    from `SL_PERCENT`/`TP_PERCENT`. Short: the bracket is mirrored (stop ABOVE
+    entry, TP BELOW) and sized from the `SHORT_SL_PERCENT`/`SHORT_TP_PERCENT`
+    tunables, so short risk can be re-tuned without disturbing the proven long
+    config. Both sides use the same `MIN_TP_PERCENT` floor and `MIN_RISK_REWARD`
+    widening, so a mirrored bracket can never be fee-negative either.
 
     The stop is the strategy's own level: fixed fraction by default, or
     `SL_ATR_MULTIPLIER × ATR` when that tunable is > 0 and an ATR is available
-    (volatility-adaptive stop). The take-profit is `TP_PERCENT`, floored at
-    `MIN_TP_PERCENT` and widened to `MIN_RISK_REWARD` of the stop distance.
+    (volatility-adaptive stop).
     """
+    if side == "short":
+        return _short_bracket(entry_price, config, atr)
     entry_price = float(entry_price)
     sl_atr = _fnum(config.get("SL_ATR_MULTIPLIER"), 0.0)
     atr_val = _fnum(atr, 0.0)
@@ -82,20 +90,65 @@ def effective_bracket(entry_price, config, atr=None):
     return stop_price, take_profit
 
 
-def effective_stop(stop_price, trailing_stop, trailing_active):
-    """The price a protective SELL actually triggers at."""
+def _short_bracket(entry_price, config, atr=None):
+    """Mirror of the long bracket: stop above entry, take-profit below it.
+
+    Risk levels come from `SHORT_SL_PERCENT`/`SHORT_TP_PERCENT` (falling back to
+    the long keys if a caller has not supplied them). The ATR stop, when armed,
+    is clamped so a volatility spike cannot push the stop further than
+    `SL_ATR_MAX_PERCENT` ABOVE entry; the TP keeps the same floor/risk-reward
+    guarantees as the long side.
+    """
+    entry_price = float(entry_price)
+    sl_atr = _fnum(config.get("SL_ATR_MULTIPLIER"), 0.0)
+    atr_val = _fnum(atr, 0.0)
+    sl_frac = _fnum(config.get("SHORT_SL_PERCENT"), _fnum(config.get("SL_PERCENT"), 0.02))
+    tp_frac = _fnum(config.get("SHORT_TP_PERCENT"), _fnum(config.get("TP_PERCENT"), 0.04))
+    if sl_atr > 0 and atr_val > 0:
+        stop_price = entry_price + sl_atr * atr_val
+        price_ceiling = entry_price * (1 + _fnum(config.get("SL_ATR_MAX_PERCENT"), 0.0))
+        if price_ceiling > entry_price:
+            stop_price = min(stop_price, price_ceiling)
+    else:
+        stop_price = entry_price * (1 + sl_frac)
+    if stop_price <= entry_price:
+        # Degenerate (ATR < 0 / bad config): fall back to the fixed % stop so the
+        # risk distance stays positive for sizing.
+        stop_price = entry_price * (1 + sl_frac)
+
+    take_profit = entry_price * (1 - tp_frac)
+    min_tp_dist = entry_price * _fnum(config.get("MIN_TP_PERCENT"), 0.0)
+    if entry_price - take_profit < min_tp_dist:
+        take_profit = entry_price - min_tp_dist
+    sl_dist = stop_price - entry_price
+    min_rr = _fnum(config.get("MIN_RISK_REWARD"), 1.5)
+    if sl_dist > 0 and (entry_price - take_profit) / sl_dist < min_rr:
+        take_profit = entry_price - sl_dist * min_rr
+    return stop_price, take_profit
+
+
+def effective_stop(stop_price, trailing_stop, trailing_active, side="long"):
+    """The price a protective exit actually triggers at.
+
+    Long: the HIGHER of the hard stop and the active trail (both sit below
+    entry). Short: the LOWER of the two (both sit above entry) — a short's stop
+    ratchets DOWN, so "most protective" is the minimum.
+    """
     stop = _fnum(stop_price)
     if trailing_active:
-        stop = max(stop, _fnum(trailing_stop))
+        if side == "short":
+            stop = min(stop, _fnum(trailing_stop))
+        else:
+            stop = max(stop, _fnum(trailing_stop))
     return stop
 
 
-def scale_out_plan(entry_price, quantity, initial_stop_price, stop_price, config):
-    """Units to sell for the 1R partial-profit leg (0.0 = no scale-out).
+def scale_out_plan(entry_price, quantity, initial_stop_price, stop_price, config, side="long"):
+    """Units to close for the 1R partial-profit leg (0.0 = no scale-out).
 
-    R is measured against the INITIAL stop: the breakeven lock raises the live
-    stop long before +1R, which would otherwise make (entry − stop) negative and
-    permanently disable scale-out.
+    R is measured against the INITIAL stop: the breakeven lock moves the live
+    stop long before +1R, which would otherwise make the risk distance negative
+    and permanently disable scale-out.
     """
     if not config.get("SCALE_OUT_ENABLED", False):
         return 0.0
@@ -103,36 +156,45 @@ def scale_out_plan(entry_price, quantity, initial_stop_price, stop_price, config
     if qty <= 0:
         return 0.0
     anchor = _fnum(initial_stop_price) or _fnum(stop_price)
-    risk_per_unit = _fnum(entry_price) - anchor
+    entry = _fnum(entry_price)
+    risk_per_unit = (anchor - entry) if side == "short" else (entry - anchor)
     if risk_per_unit <= 0:
         return 0.0
     fraction = min(max(_fnum(config.get("SCALE_OUT_FRACTION"), 0.5), 0.0), 0.95)
     return qty * fraction
 
 
-def scale_out_price(entry_price, initial_stop_price, stop_price, config):
+def scale_out_price(entry_price, initial_stop_price, stop_price, config, side="long"):
     """Price level of the scale-out leg (+R multiple of the initial stop)."""
     anchor = _fnum(initial_stop_price) or _fnum(stop_price)
-    risk_per_unit = _fnum(entry_price) - anchor
+    entry = _fnum(entry_price)
+    risk_per_unit = (anchor - entry) if side == "short" else (entry - anchor)
     if risk_per_unit <= 0:
         return None
     multiple = _fnum(config.get("SCALE_OUT_R_MULTIPLE"), 1.0)
-    return _fnum(entry_price) + risk_per_unit * multiple
+    if side == "short":
+        return entry - risk_per_unit * multiple
+    return entry + risk_per_unit * multiple
 
 
 def ratchet_stops(entry_price, favorable_price, stop_price, config,
                   trailing_stop=None, trailing_active=False,
-                  breakeven_activated=False, atr=None):
+                  breakeven_activated=False, atr=None, side="long"):
     """Profit-protection ladder evaluated on a favourable mark.
 
     Order matches the live engine: breakeven lock first, then the trailing stop.
-    Only ever RAISES the stop — a ratchet is never loosened.
+    Long: only ever RAISES the stop. Short: only ever LOWERS it (the mirror — a
+    short's protective stop sits above entry and moves down as price falls).
 
-    `favorable_price` is the best mark seen since the last call (the live engine
-    passes the tick; the backtest passes the bar high). Returns the fields to
+    `favorable_price` is the best mark seen since the last call (for a long that
+    is the highest print; for a short it is the LOWEST). Returns the fields to
     persist: ``stop_price``, ``trailing_stop``, ``trailing_active``,
     ``breakeven_activated``.
     """
+    if side == "short":
+        return _ratchet_stops_short(entry_price, favorable_price, stop_price, config,
+                                    trailing_stop, trailing_active,
+                                    breakeven_activated, atr)
     entry = _fnum(entry_price)
     mark = _fnum(favorable_price)
     stop = _fnum(stop_price)
@@ -175,12 +237,62 @@ def ratchet_stops(entry_price, favorable_price, stop_price, config,
     return out
 
 
+def _ratchet_stops_short(entry_price, favorable_price, stop_price, config,
+                         trailing_stop=None, trailing_active=False,
+                         breakeven_activated=False, atr=None):
+    """Short mirror of `ratchet_stops`: the ladder only ever moves DOWN.
+
+    `favorable_price` is the LOWEST print seen (the "bar low" for a replay, the
+    wick low for the live engine). Breakeven sits at entry × (1 − offset) and the
+    trail hangs `TRAILING_STOP_CALLBACK` (or an ATR multiple) ABOVE the mark.
+    """
+    entry = _fnum(entry_price)
+    mark = _fnum(favorable_price)
+    stop = _fnum(stop_price)
+    trail = _fnum(trailing_stop, stop) if trailing_stop is not None else stop
+    out = {
+        "stop_price": stop,
+        "trailing_stop": trail,
+        "trailing_active": bool(trailing_active),
+        "breakeven_activated": bool(breakeven_activated),
+    }
+    if entry <= 0 or mark <= 0:
+        return out
+
+    # 1) Breakeven lock: once price falls BREAKEVEN_TRIGGER in favour, move the
+    #    stop to entry × (1 − BREAKEVEN_OFFSET) — covering round-trip fees.
+    if config.get("BREAKEVEN_ENABLED", True) and not out["breakeven_activated"]:
+        if (entry - mark) / entry >= _fnum(config.get("BREAKEVEN_TRIGGER"), 0.01):
+            out["breakeven_activated"] = True
+            be_price = entry * (1 - _fnum(config.get("BREAKEVEN_OFFSET"), 0.0025))
+            if be_price < out["stop_price"]:
+                out["stop_price"] = be_price
+            if be_price < out["trailing_stop"]:
+                out["trailing_stop"] = be_price
+
+    # 2) Trailing stop: arms at TRAILING_STOP_ACTIVATE profit, then ratchets down
+    #    behind the favourable (low) mark.
+    activate = _fnum(config.get("TRAILING_STOP_ACTIVATE"), 1.0)
+    if activate > 0 and entry > 0 and (entry - mark) / entry >= activate:
+        out["trailing_active"] = True
+    if out["trailing_active"]:
+        atr_mult = _fnum(config.get("TRAILING_ATR_MULTIPLIER"), 0.0)
+        atr_val = _fnum(atr, 0.0)
+        if atr_mult > 0 and atr_val > 0:
+            new_trail = mark + atr_mult * atr_val
+        else:
+            new_trail = mark * (1 + _fnum(config.get("TRAILING_STOP_CALLBACK"), 0.01))
+        if new_trail < out["trailing_stop"]:
+            out["trailing_stop"] = new_trail
+    return out
+
+
 def evaluate_exit(entry_price, quantity, stop_price, take_profit, config,
                   low=None, high=None, reference_price=None,
                   now_ms=None, entry_ms=None, trailing_stop=None,
                   trailing_active=False, initial_stop_price=None,
-                  scale_out_done=False, eod=False):
-    """The single exit DECISION for an open bullish position.
+                  scale_out_done=False, eod=False, side="long"):
+    """The single exit DECISION for an open position (`side` aware).
 
     `trade_logic.manage_trade` (live, once per poll) and `backtest.run_backtest`
     (proof, once per bar) both call this, so the rule cannot drift between what
@@ -217,7 +329,17 @@ def evaluate_exit(entry_price, quantity, stop_price, take_profit, config,
     window rather than banking a partial into a position that is closing anyway.
 
     Returns an `ExitPlan`; `reason is None and partial_units == 0` means hold.
+
+    A short mirrors every comparison: its stop triggers on `high >= stop`, its
+    take-profit on `low <= tp`, and the trailing stop is armed when the trail has
+    moved BELOW the hard stop.
     """
+    if side == "short":
+        return _evaluate_exit_short(entry_price, quantity, stop_price, take_profit,
+                                    config, low=low, high=high, reference_price=reference_price,
+                                    now_ms=now_ms, entry_ms=entry_ms, trailing_stop=trailing_stop,
+                                    trailing_active=trailing_active, initial_stop_price=initial_stop_price,
+                                    scale_out_done=scale_out_done, eod=eod)
     entry = _fnum(entry_price)
     low = _fnum(low)
     high = _fnum(high)
@@ -255,4 +377,49 @@ def evaluate_exit(entry_price, quantity, stop_price, take_profit, config,
         return ExitPlan(partial_units=units,
                         partial_price=max(level, ref) if ref > 0 else level)
 
+    return ExitPlan()
+
+
+def _evaluate_exit_short(entry_price, quantity, stop_price, take_profit, config, **kw):
+    """Short mirror of `evaluate_exit` — same priority order, reversed evidence.
+
+    1. protective stop on `high >= stop` (trail reports TRAILING_STOP)
+    2. take-profit on `low <= tp`
+    3. time stop
+    4. day-end flatten
+    5. +R scale-out on `low <= level`
+    Everything else (pessimistic intrabar fill, terminal exits pre-empting the
+    partial) is identical to the long path.
+    """
+    entry = _fnum(entry_price)
+    low = _fnum(kw.get("low"))
+    high = _fnum(kw.get("high"))
+    ref = _fnum(kw.get("reference_price"))
+    stop = effective_stop(stop_price, kw.get("trailing_stop"), kw.get("trailing_active", False), side="short")
+    tp = _fnum(take_profit)
+    trail_armed = bool(kw.get("trailing_active")) and stop < _fnum(stop_price)
+
+    # 1) Protective stop: a short is stopped when price trades UP through it.
+    if stop > 0 and high > 0 and high >= stop:
+        return ExitPlan(reason="TRAILING_STOP" if trail_armed else "STOP_LOSS",
+                        fill=ref if ref > stop else stop)
+    # 2) Take-profit: a short profits when price trades DOWN through the target.
+    if tp > 0 and low > 0 and low <= tp:
+        return ExitPlan(reason="TAKE_PROFIT", fill=ref if 0 < ref < tp else tp)
+    # 3) Time stop.
+    now_ms = kw.get("now_ms")
+    entry_ms = kw.get("entry_ms")
+    max_hold = _fnum(config.get("MAX_HOLD_TIME"), 0.0)
+    if max_hold > 0 and now_ms and entry_ms and (now_ms - entry_ms) / 1000.0 > max_hold:
+        return ExitPlan(reason="TIME_STOP", fill=ref if ref > 0 else None)
+    # 4) Scheduled day-end flatten.
+    if kw.get("eod"):
+        return ExitPlan(reason="EOD_CLOSE", fill=ref if ref > 0 else None)
+    # 5) Scale-out leg at +R (bank a partial profit ONCE; position stays open).
+    units = 0.0 if kw.get("scale_out_done") else scale_out_plan(
+        entry, quantity, kw.get("initial_stop_price"), stop_price, config, side="short")
+    level = scale_out_price(entry, kw.get("initial_stop_price"), stop_price, config, side="short")
+    if units > 0 and level and low <= level and (tp <= 0 or level > tp):
+        return ExitPlan(partial_units=units,
+                        partial_price=min(level, ref) if ref > 0 else level)
     return ExitPlan()

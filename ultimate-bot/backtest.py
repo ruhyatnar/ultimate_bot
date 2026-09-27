@@ -178,8 +178,14 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                  sl_percent=None, tp_percent=None, cooldown_bars=None, min_tp=None,
                  max_hold=None, min_notional=None, equity=None,
                  balance_usage_percent=None, max_symbol_allocation_percent=None,
-                 overrides=None, market="spot"):
+                 overrides=None, market="spot", allow_shorts=None):
     """Replay the strategy on real klines.
+
+    `allow_shorts=True` (futures only) arms the symmetric short mirror: SELL an
+    overbought RSI rip inside a confirmed daily downtrend, with the mirrored
+    SHORT_SL_PERCENT/SHORT_TP_PERCENT bracket, a stop that ratchets DOWN and
+    funding that a short RECEIVES on a positive rate. It is OFF unless the
+    resolved config (`.env`/overrides) has ALLOW_SHORTS=true.
 
     market="futures" switches the whole simulation to USDⓈ-M perp assumptions:
       * klines fetched from fapi (futures prices/order books differ slightly)
@@ -208,6 +214,12 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
     cfg = load_config()
     if overrides:
         cfg.update(overrides)
+    if allow_shorts is not None:
+        cfg["ALLOW_SHORTS"] = bool(allow_shorts)
+    # The `--market` flag is the backtest's source of truth for direction
+    # availability (a short is a futures-only instrument), so mirror it into the
+    # config the shared SignalGenerator.decide() reads.
+    cfg["MARKET"] = market
     if sl_percent is not None: cfg["SL_PERCENT"] = float(sl_percent)
     if tp_percent is not None: cfg["TP_PERCENT"] = float(tp_percent)
     if min_tp is not None: cfg["MIN_TP_PERCENT"] = float(min_tp)
@@ -281,6 +293,10 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
     # value from fapi exchangeInfo (5 USDT on most perps, 20-50 on a few) unless
     # the caller overrode it for research.
     is_futures = (market == "futures")
+    # Shorts are futures-only (a spot SELL closes a holding; it cannot open a
+    # short). The shared decide() gates on ALLOW_SHORTS, so a disabled/false flag
+    # leaves the replay byte-for-byte long-only.
+    allow_short = bool(cfg.get("ALLOW_SHORTS", False)) and is_futures
     fee_leg = FUTURES_TAKER_FEE if is_futures else TAKER_FEE
     if min_notional is not None:
         min_notional = float(min_notional)   # explicit research override wins
@@ -314,15 +330,21 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
         funding_lookup = sorted(funding_events)
         funding_events = list(funding_lookup)
 
+    def _dirn(side):
+        """+1 for a long PnL/R sign, −1 for a short (a short gains when price falls)."""
+        return 1.0 if side == "long" else -1.0
+
     def record(i, reason, fill_price, qty, entry_price, initial_stop, entry_fee):
-        gross = (fill_price - entry_price) * qty
+        sign = _dirn(position["side"])
+        gross = sign * (fill_price - entry_price) * qty
         fees = entry_fee + fill_price * qty * fee_leg
+        risk = ((entry_price - initial_stop) if position["side"] == "long"
+                else (initial_stop - entry_price))
         return {"reason": reason, "entry_price": entry_price, "exit_price": fill_price,
                 "qty": qty, "gross": gross, "fees": fees, "pnl": gross - fees,
                 "exit_index": i, "entry_index": position["entry_index"],
-                "entry_ms": position["entry_ms"],
-                "r": (fill_price - entry_price) / (entry_price - initial_stop)
-                     if (entry_price - initial_stop) > 0 else 0.0}
+                "entry_ms": position["entry_ms"], "side": position["side"],
+                "r": (sign * (fill_price - entry_price)) / risk if risk > 0 else 0.0}
 
     for i in range(lookback_total, n):
         # ---- daily drawdown circuit breaker (resets each UTC day) ----
@@ -359,7 +381,9 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                 while funding_events and funding_events[0][0] < bar_end:
                     f_ms, f_rate = funding_events.pop(0)
                     if f_ms >= times[i]:
-                        f_fee = f_rate * p["entry"] * p["qty"]
+                        # A long PAYS a positive rate; a short RECEIVES it (the
+                        # mirror), so the sign follows the position's side.
+                        f_fee = _dirn(p["side"]) * f_rate * p["entry"] * p["qty"]
                         equity -= f_fee
                         funding_total += f_fee
             # Day-end flatten: the live trigger is the wall clock inside the last
@@ -377,6 +401,7 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                 initial_stop_price=p.get("initial_stop"),
                 scale_out_done=p.get("scale_out_done", False),
                 eod=bool(close_eod and bar_day != entry_day),
+                side=p["side"],
             )
             if plan.reason:
                 leg = record(i, plan.reason, plan.fill, p["qty"], p["entry"],
@@ -392,15 +417,16 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                 # +R scale-out: bank part of the position, keep the runner open.
                 qty = min(plan.partial_units, p["qty"])
                 fee = (p["entry"] * qty + plan.partial_price * qty) * fee_leg
+                _sign = _dirn(p["side"])
+                _anchor = p.get("initial_stop") or p["stop"]
+                _risk = ((p["entry"] - _anchor) if p["side"] == "long" else (_anchor - p["entry"]))
                 leg = {"reason": "PARTIAL_EXIT", "partial": True, "entry_price": p["entry"],
-                       "exit_price": plan.partial_price, "qty": qty,
-                       "gross": (plan.partial_price - p["entry"]) * qty, "fees": fee,
-                       "pnl": (plan.partial_price - p["entry"]) * qty - fee,
+                       "exit_price": plan.partial_price, "qty": qty, "side": p["side"],
+                       "gross": _sign * (plan.partial_price - p["entry"]) * qty, "fees": fee,
+                       "pnl": _sign * (plan.partial_price - p["entry"]) * qty - fee,
                        "exit_index": i, "entry_index": p["entry_index"],
                        "entry_ms": p["entry_ms"],
-                       "r": ((plan.partial_price - p["entry"]) /
-                             (p["entry"] - (p.get("initial_stop") or p["stop"])))
-                            if (p["entry"] - (p.get("initial_stop") or p["stop"])) > 0 else 0.0}
+                       "r": (_sign * (plan.partial_price - p["entry"])) / _risk if _risk > 0 else 0.0}
                 equity += leg["pnl"]
                 trades.append(leg)
                 p["entry_fee"] -= p["entry"] * qty * fee_leg   # entry fee already paid on the sold part
@@ -411,7 +437,7 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                                          trailing_stop=p.get("trailing_stop"),
                                          trailing_active=p.get("trailing_active", False),
                                          breakeven_activated=p.get("breakeven_activated", False),
-                                         atr=p.get("atr"))
+                                         atr=p.get("atr"), side=p["side"])
                 p["stop"] = _ratchet["stop_price"]
                 p["trailing_stop"] = _ratchet["trailing_stop"]
                 p["trailing_active"] = _ratchet["trailing_active"]
@@ -420,11 +446,14 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
                 # Profit-protection ladder on this bar's favourable extreme — the
                 # same observable the live engine feeds (its wick high), applied at
                 # the same point in the cycle (after the decision).
-                _ratchet = ratchet_stops(p["entry"], bar["high"], p["stop"], cfg,
+                # The favourable extreme is the bar HIGH for a long and the bar
+                # LOW for a short — the mirror observable the policy ratchets off.
+                _fav = bar["low"] if p["side"] == "short" else bar["high"]
+                _ratchet = ratchet_stops(p["entry"], _fav, p["stop"], cfg,
                                          trailing_stop=p.get("trailing_stop"),
                                          trailing_active=p.get("trailing_active", False),
                                          breakeven_activated=p.get("breakeven_activated", False),
-                                         atr=p.get("atr"))
+                                         atr=p.get("atr"), side=p["side"])
                 p["stop"] = _ratchet["stop_price"]
                 p["trailing_stop"] = _ratchet["trailing_stop"]
                 p["trailing_active"] = _ratchet["trailing_active"]
@@ -459,29 +488,38 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
         htf_win = daily_df[daily_df["open_time"] < times[i] + tf_ms]
         ltf_win = df.iloc[i - ltf_bars + 1: i + 1]
         signal, atr = sg.decide(htf_win, ltf_win, symbol=symbol)
-        if signal != "BUY":
+        # decide() returns BUY (long dip in a confirmed uptrend) or SELL (short
+        # rip in a confirmed downtrend, only when ALLOW_SHORTS is armed).
+        if signal == "BUY":
+            side = "long"
+        elif signal == "SELL" and allow_short:
+            side = "short"
+        else:
             equity_curve.append(equity)
             continue
 
         # ---- funding-rate entry gate (futures only) ----
         # Mirrors trade_logic.enter_trade: a long PAYS funding when the rate is
-        # positive, so pairs whose rate exceeds FUNDING_RATE_MAX are skipped and the
-        # capital stays available for pairs where funding is neutral. The live gate
-        # reads the last settled rate at decision time (the bar's close here).
+        # positive, so pairs whose rate exceeds FUNDING_RATE_MAX are skipped. A
+        # short pays the opposite sign, so it is capped on a NEGATIVE rate. The
+        # live gate reads the last settled rate at decision time (bar close here).
         # 0 disables it; missing history (network failure) never blocks a setup,
         # matching the engine's "unreadable funding must not block a proven entry".
         if is_futures and fr_max > 0 and funding_lookup:
             _idx = bisect.bisect_right(funding_lookup, (times[i] + tf_ms, float("inf"))) - 1
-            if _idx >= 0 and funding_lookup[_idx][1] > fr_max:
-                funding_gate_skips += 1
-                equity_curve.append(equity)
-                continue
+            if _idx >= 0:
+                _rate = funding_lookup[_idx][1]
+                if (side == "long" and _rate > fr_max) or (side == "short" and _rate < -fr_max):
+                    funding_gate_skips += 1
+                    equity_curve.append(equity)
+                    continue
 
         entry = closes[i]
         # Bracket from the SHARED policy (fixed % by default, ATR-adaptive when
-        # SL_ATR_MULTIPLIER > 0) — identical math to trade_logic.enter_trade.
-        stop, tp = effective_bracket(entry, cfg, atr)
-        sl_dist = entry - stop
+        # SL_ATR_MULTIPLIER > 0) — identical math to trade_logic.enter_trade,
+        # mirrored for a short (stop ABOVE entry, TP below).
+        stop, tp = effective_bracket(entry, cfg, atr, side=side)
+        sl_dist = (entry - stop) if side == "long" else (stop - entry)
         if sl_dist <= 0:
             equity_curve.append(equity)
             continue
@@ -491,7 +529,7 @@ def run_backtest(symbol, preset_name, pages, end_time=None, quiet=False,
             equity_curve.append(equity)
             continue
         position = {"entry": entry, "stop": stop, "tp": tp, "qty": qty,
-                    "entry_fee": entry * qty * fee_leg,
+                    "entry_fee": entry * qty * fee_leg, "side": side,
                     "entry_index": i, "entry_ms": times[i],
                     "initial_stop": stop, "atr": atr,
                     "trailing_stop": stop, "trailing_active": False,
@@ -618,6 +656,8 @@ def main():
     parser.add_argument("--balance-usage-percent", type=float, default=_env_num("BACKTEST_BALANCE_USAGE_PERCENT", float), help="override BALANCE_USAGE_PERCENT")
     parser.add_argument("--max-symbol-allocation-percent", type=float, default=_env_num("BACKTEST_MAX_SYMBOL_ALLOCATION_PERCENT", float), help="override MAX_SYMBOL_ALLOCATION_PERCENT")
     parser.add_argument("--quiet", action="store_true", default=_env_bool("BACKTEST_QUIET"), help="one-line summary instead of full JSON")
+    parser.add_argument("--shorts", action="store_true", default=None,
+                        help="arm the futures-only short mirror (ALLOW_SHORTS); omitted = use the resolved config")
     args = parser.parse_args()
 
     print(f"Backtesting {args.symbol} | preset={args.preset} | market={args.market} | "
@@ -630,7 +670,7 @@ def main():
                           min_notional=args.min_notional, equity=args.equity,
                           balance_usage_percent=args.balance_usage_percent,
                           max_symbol_allocation_percent=args.max_symbol_allocation_percent,
-                          market=args.market)
+                          market=args.market, allow_shorts=args.shorts)
     if result is None:
         return 2
     print(f"\nCompleted in {time.time() - t0:.1f}s")

@@ -201,6 +201,16 @@ def load_config():
         "ENTRY_VOL_LOOKBACK": _env_int("ENTRY_VOL_LOOKBACK", 20),
         "ENTRY_RSI_MIN": _env_float("ENTRY_RSI_MIN", 0.0),
         "ENTRY_REQUIRE_RSI_RISE2": os.getenv("ENTRY_REQUIRE_RSI_RISE2", "false").lower() == "true",
+        # --- Short-side mirror (prototype; MARKET=futures only) ---
+        # ALLOW_SHORTS arms the symmetric short signal: a SELL on an overbought
+        # RSI rip in a confirmed daily-downtrend (price below a falling EMA50).
+        # OFF by default so the proven long baseline is unchanged. Its risk levels
+        # are separate SHORT_* tunables so shorting can be tuned without touching
+        # the long config. Config validation requires MARKET=futures when armed.
+        "ALLOW_SHORTS": os.getenv("ALLOW_SHORTS", "false").lower() == "true",
+        "SHORT_RSI_OVERBOUGHT": _env_float("SHORT_RSI_OVERBOUGHT", 60.0),
+        "SHORT_SL_PERCENT": _env_float("SHORT_SL_PERCENT", 0.012),
+        "SHORT_TP_PERCENT": _env_float("SHORT_TP_PERCENT", 0.03),
         "RSI_PERIOD": _env_int("RSI_PERIOD", preset.get("RSI_PERIOD", 14)),
         "RSI_OVERSOLD": _env_float("RSI_OVERSOLD", preset.get("RSI_OVERSOLD", 40.0)),
         "RSI_TIMEFRAME": os.getenv("RSI_TIMEFRAME", preset.get("RSI_TIMEFRAME", "1h")),
@@ -325,6 +335,12 @@ def load_config():
         raise ValueError("ENTRY_VOL_MULT must be >= 0 (0 = gate off).")
     if not (0 <= config["ENTRY_RSI_MIN"] < 100):
         raise ValueError("ENTRY_RSI_MIN must be in [0, 100) (0 = gate off).")
+    # Short-side mirror levels (validated even when ALLOW_SHORTS is off, so a
+    # later opt-in can never be blocked by a bad value that sat unchecked).
+    if not (0 < config["SHORT_SL_PERCENT"] < config["SHORT_TP_PERCENT"] <= 1):
+        raise ValueError("SHORT_SL_PERCENT/SHORT_TP_PERCENT: need 0 < SHORT_SL_PERCENT < SHORT_TP_PERCENT <= 1.")
+    if not (0 < config["SHORT_RSI_OVERBOUGHT"] < 100):
+        raise ValueError("SHORT_RSI_OVERBOUGHT must be between 0 and 100 (exclusive).")
     if config["ENTRY_EXT_EMA"] < 2 or config["ENTRY_VOL_LOOKBACK"] < 2:
         raise ValueError("ENTRY_EXT_EMA / ENTRY_VOL_LOOKBACK must be >= 2.")
     if not isinstance(config["RSI_PERIOD"], int) or config["RSI_PERIOD"] < 2:
@@ -360,6 +376,8 @@ def load_config():
         raise ValueError("At least one symbol must be provided.")
     if config["MARKET"] not in ("spot", "futures"):
         raise ValueError("MARKET must be 'spot' or 'futures'.")
+    if config["ALLOW_SHORTS"] and config["MARKET"] != "futures":
+        raise ValueError("ALLOW_SHORTS requires MARKET=futures (the short mirror is a futures-only strategy).")
     if config["MARKET"] == "futures":
         if config["FUTURES_MARGIN_TYPE"] not in ("ISOLATED", "CROSSED"):
             raise ValueError("FUTURES_MARGIN_TYPE must be ISOLATED or CROSSED.")

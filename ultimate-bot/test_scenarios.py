@@ -1524,6 +1524,69 @@ finally:
     _st19._ENV_MTIME.clear()
     _st19._ENV_MTIME.update(_s19_saved_mtime)
 
+# --- S20: short-selling mirror (futures-only prototype) ------------------
+# The short path is a MIRROR of the long path in the SHARED policy, gated behind
+# ALLOW_SHORTS (default off). These checks lock in (a) the mirror math, (b) that
+# the long baseline cannot regress, and (c) the default-off / futures-only gate.
+from src.strategies.trade_policy import (
+    effective_bracket, effective_stop, ratchet_stops, evaluate_exit,
+)
+
+_cfg = {"SL_PERCENT": 0.012, "TP_PERCENT": 0.03, "SHORT_SL_PERCENT": 0.012,
+        "SHORT_TP_PERCENT": 0.03, "MIN_TP_PERCENT": 0.03, "MIN_RISK_REWARD": 1.5,
+        "SL_ATR_MULTIPLIER": 0.0, "BREAKEVEN_ENABLED": False,
+        "TRAILING_STOP_ACTIVATE": 0.01, "TRAILING_STOP_CALLBACK": 0.01,
+        "TRAILING_ATR_MULTIPLIER": 0.0, "MAX_HOLD_TIME": 84600, "SCALE_OUT_ENABLED": False}
+
+_l_stop, _l_tp = effective_bracket(100.0, _cfg)
+check("S20 long bracket unchanged (stop below, TP above)",
+      _l_stop < 100.0 < _l_tp, f"stop={_l_stop} tp={_l_tp}")
+
+_s_stop, _s_tp = effective_bracket(100.0, _cfg, side="short")
+check("S20 short bracket mirrored (stop above, TP below)",
+      _s_stop > 100.0 > _s_tp, f"stop={_s_stop} tp={_s_tp}")
+
+check("S20 short protective stop uses min(hard, trail)",
+      abs(effective_stop(101.5, 101.0, True, side="short") - 101.0) < 1e-9)
+
+_r = ratchet_stops(100.0, 99.0, 101.2, _cfg, trailing_stop=101.2,
+                   trailing_active=False, breakeven_activated=False, side="short")
+check("S20 short trail ratchets DOWN",
+      _r["trailing_active"] and _r["trailing_stop"] < 101.2, f"{_r}")
+
+_pe = evaluate_exit(100.0, 1.0, 101.2, 97.0, _cfg, low=100.2, high=101.3,
+                    reference_price=101.3, side="short")
+check("S20 short STOP_LOSS fires on high>=stop",
+      _pe.reason == "STOP_LOSS" and abs(_pe.fill - 101.3) < 1e-9, f"{_pe}")
+
+_pt = evaluate_exit(100.0, 1.0, 101.2, 97.0, _cfg, low=96.9, high=100.1,
+                    reference_price=96.9, side="short")
+check("S20 short TAKE_PROFIT fires on low<=tp",
+      _pt.reason == "TAKE_PROFIT" and abs(_pt.fill - 96.9) < 1e-9, f"{_pt}")
+
+# config gate: ALLOW_SHORTS on the spot market must be refused at load time.
+import importlib
+_cfgmod = importlib.import_module("config")
+_saved_market = os.environ.get("MARKET")
+os.environ["ALLOW_SHORTS"], os.environ["MARKET"] = "true", "spot"
+try:
+    _cfgmod.load_config()
+    _raised = False
+except ValueError:
+    _raised = True
+finally:
+    os.environ.pop("ALLOW_SHORTS", None)
+    if _saved_market is None:
+        os.environ.pop("MARKET", None)
+    else:
+        os.environ["MARKET"] = _saved_market
+check("S20 ALLOW_SHORTS rejected on the spot market", _raised)
+
+import status as _sts
+check("S20 short tunables exposed on the config surface",
+      {"ALLOW_SHORTS", "SHORT_RSI_OVERBOUGHT", "SHORT_SL_PERCENT",
+       "SHORT_TP_PERCENT"} <= _sts.TUNING_KEYS)
+
 print()
 print("ALL_OK" if not FAILS else f"FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

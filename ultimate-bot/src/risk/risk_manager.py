@@ -447,13 +447,15 @@ class RiskManager:
             await self.save_state()
             await self._publish_risk_snapshot()
 
-    async def calculate_position_size(self, symbol, entry_price, stop_price):
+    async def calculate_position_size(self, symbol, entry_price, stop_price, side="long"):
         """Fixed-fractional risk position sizing (the professional standard).
 
-        Primary formula: qty = (equity * RISK_PER_TRADE) / (entry - stop).
+        Primary formula: qty = (equity * RISK_PER_TRADE) / |entry - stop|.
         This makes every trade risk the same fixed fraction of equity (default 1%)
         regardless of how wide the ATR stop is — a 2x-ATR swing stop and a 1x-ATR
-        scalp stop both lose exactly RISK_PER_TRADE of equity when hit.
+        scalp stop both lose exactly RISK_PER_TRADE of equity when hit. The distance
+        is taken as an absolute value so the SAME formula sizes a short (whose stop
+        sits ABOVE entry, giving a negative entry − stop).
 
         The notional allocation cap (BALANCE_USAGE_PERCENT / per-symbol cap) is kept
         as a SECONDARY ceiling so sizing can never exceed portfolio limits — but it
@@ -464,11 +466,11 @@ class RiskManager:
             self.logger.warning(f"Position sizing skipped for {symbol}: total_equity={self.total_equity}, entry_price={entry_price}")
             return 0.0
 
-        # --- Primary: risk-based sizing ---
-        stop_dist = entry_price - stop_price
+        # --- Primary: risk-based sizing (distance is side-agnostic) ---
+        stop_dist = (entry_price - stop_price) if side == "long" else (stop_price - entry_price)
         risk_per_unit = stop_dist if stop_dist > 0 else 0.0
         if risk_per_unit <= 0:
-            self.logger.warning(f"Position sizing skipped for {symbol}: stop_price {stop_price} >= entry_price {entry_price} (no defined risk).")
+            self.logger.warning(f"Position sizing skipped for {symbol}: stop/entry give no defined risk (side={side}, entry={entry_price}, stop={stop_price}).")
             return 0.0
         risk_amount = float(self.total_equity) * float(self.config.get("RISK_PER_TRADE", 0.01))
         risk_qty = risk_amount / risk_per_unit

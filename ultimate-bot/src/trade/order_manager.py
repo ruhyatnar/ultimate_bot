@@ -54,7 +54,19 @@ class OrderManager:
             clean_qty = clean_qty.rstrip("0").rstrip(".")
         return clean_qty, price
 
-    async def place_market_order(self, symbol, side, quantity, expected_price=None):
+    async def place_market_order(self, symbol, side, quantity, expected_price=None, reduce_only=None):
+        """Place a MARKET order.
+
+        `reduce_only` decides what the order MEANS on futures and therefore which
+        pre-trade guard runs:
+          * None (default, back-compat): a futures SELL reduces a long — this is
+            the engine's only legacy path, so the old behaviour is preserved.
+          * True:  a close (long exit = SELL, short exit = BUY).
+          * False: an OPENING order (long entry = BUY, short entry = SELL).
+        A short ENTRY (SELL, reduce_only=False) must not be clamped to the long
+        positionAmt — positionAmt is 0/opposite for a fresh short, so the exit clamp
+        would silently zero every short entry.
+        """
         if self.paper_trade:
             ticker = await self.rest.get_ticker(symbol)
             price = float(ticker["price"])
@@ -82,7 +94,14 @@ class OrderManager:
                     self.logger.warning(f"Slippage too high for {symbol}: {slippage:.2f}% (current {current_price}, expected {expected_price})")
                     return None
             is_futures = self.config.get("MARKET", "spot") == "futures"
-            if side == "SELL":
+            if reduce_only is None:
+                # Back-compat: a futures SELL closes a long. New callers (short
+                # entries, short exits) pass reduce_only explicitly.
+                reduce_only = is_futures and side == "SELL"
+            # A futures SELL that OPENS exposure is a short entry, not a long exit,
+            # so it must skip the long-position clamp below.
+            is_short_entry = is_futures and side == "SELL" and not reduce_only
+            if side == "SELL" and not is_short_entry:
                 if is_futures:
                     # Futures: exposure is the POSITION (positionAmt), not a wallet
                     # balance — the wallet holds only margin. Clamping to the wallet
@@ -111,7 +130,10 @@ class OrderManager:
                     if free_base is not None and free_base < float(quantity):
                         self.logger.info(f"Available {base_asset} ({free_base}) < requested sell qty ({quantity}) - adjusting sell qty to available balance.")
                         quantity = free_base
-            else:  # BUY: pre-check free quote balance (1% fee/slippage buffer) to fail fast instead of a -2010 rejection
+            # Opening exposure (long BUY entry or futures short SELL entry): pre-check
+            # free quote balance against required margin (1% fee/slippage buffer) to
+            # fail fast instead of a -2010 rejection. Closes (reduce_only) skip it.
+            if (side == "BUY" and not reduce_only) or is_short_entry:
                 account = await get_account(self.rest, self.ws_api, self.config)
                 free_quote = next((float(b["free"]) for b in account.get("balances", []) if b["asset"] == self.config["QUOTE_ASSET"]), 0.0)
                 leverage = float(self.config.get("FUTURES_LEVERAGE", 1.0)) if is_futures else 1.0
@@ -119,8 +141,9 @@ class OrderManager:
                     leverage = 1.0
                 required_margin = (quantity * current_price) / leverage
                 if required_margin > free_quote * 0.99:
+                    order_kind = "SELL (short)" if is_short_entry else "BUY"
                     self.logger.warning(
-                        f"BUY rejected: required margin ${required_margin:.2f} (notional ${quantity * current_price:.2f} @ {leverage:.0f}x) "
+                        f"{order_kind} rejected: required margin ${required_margin:.2f} (notional ${quantity * current_price:.2f} @ {leverage:.0f}x) "
                         f"exceeds 99% of free {self.config['QUOTE_ASSET']} (${free_quote:.2f})."
                     )
                     return None
@@ -129,10 +152,10 @@ class OrderManager:
             if qty is None:
                 self.logger.warning(f"Order quantity sanitization failed for {symbol}; order skipped.")
                 return None
-            # Futures one-way mode safety: every SELL exit carries reduceOnly so
-            # a sizing bug can flip the position short instead of closing it.
-            # Spot ignores the flag (a SELL always reduces the base holding).
-            reduce_only = is_futures and side == "SELL"
+            # Futures one-way mode safety: a CLOSE carries reduceOnly so a sizing
+            # bug can never flip/overshoot the position instead of closing it. An
+            # OPENING order (long BUY, or short SELL with reduce_only=False) omits
+            # it. Spot ignores the flag (a SELL always reduces the base holding).
             try:
                 if self.ws_api and self.ws_api.is_connected():
                     resp = await self.ws_api.place_order(symbol, side, "MARKET", qty,

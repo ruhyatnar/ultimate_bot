@@ -126,7 +126,13 @@ class SignalGenerator:
         ema_now = float(ema_series.iloc[-1])
         ema_prev = float(ema_series.iloc[-1 - slope_days])
         regime_up = bool(htf["close"].iloc[-1] > ema_now and ema_now > ema_prev)
-        if not regime_up:
+        # Symmetric short regime: price BELOW a FALLING daily EMA. Only armed when
+        # price is genuinely below the EMA AND the EMA is declining, so a flat/
+        # choppy tape produces no short either. Gated behind ALLOW_SHORTS (default
+        # off) — config validation only permits it on MARKET=futures — so the
+        # proven long baseline is byte-for-byte unchanged until a deployment opts in.
+        regime_down = bool(htf["close"].iloc[-1] < ema_now and ema_now < ema_prev)
+        if not regime_up and not (regime_down and bool(self.config.get("ALLOW_SHORTS", False))):
             self.logger.debug(f"{symbol}: rsi_dip regime DOWN/flat — no bullish entries.")
             self._record(symbol, regime="DOWN", regime_ema=regime_ema,
                          regime_price=float(htf["close"].iloc[-1]), regime_ema_value=ema_now,
@@ -135,9 +141,15 @@ class SignalGenerator:
                          reason=f"daily regime down/flat (close {float(htf['close'].iloc[-1]):.6g} vs EMA{regime_ema} {ema_now:.6g})")
             return "NEUTRAL", current_atr_val
 
-        # ---- 2) RSI pullback trigger (RSI on execution-TF closes, sampled per bucket) ----
+        # ---- 2) RSI trigger (RSI on execution-TF closes, sampled per bucket) ----
+        # Long: an oversold dip that is turning UP. Short (ALLOW_SHORTS): the
+        # mirror image in a confirmed downtrend — an OVERBOUGHT rip that is turning
+        # DOWN. Same bucket-close discipline and same one-shot-per-bucket rule.
+        is_short = bool(regime_down)
+        regime_label = "DOWN" if is_short else "UP"
         rsi_period = int(self.config.get("RSI_PERIOD", 14))
         oversold = float(self.config.get("RSI_OVERSOLD", 40))
+        overbought = float(self.config.get("SHORT_RSI_OVERBOUGHT", 60.0))
         bucket_ms = int(self.config.get("RSI_TIMEFRAME_MS", 3_600_000))
 
         l = ltf_df.copy()
@@ -147,23 +159,23 @@ class SignalGenerator:
         l = l.assign(_rsi=self._rsi_wilder(l["close"], rsi_period).values)
         rsi = l.groupby("bucket")["_rsi"].last()
         if len(rsi) < 2:
-            self._record(symbol, regime="UP", regime_ema=regime_ema, rsi=None, rsi_prev=None,
+            self._record(symbol, regime=regime_label, regime_ema=regime_ema, rsi=None, rsi_prev=None,
                          trigger=False, signal="NEUTRAL", atr=current_atr_val,
                          reason="RSI not ready (fewer than 2 buckets)")
             return "NEUTRAL", current_atr_val
         rsi_last, rsi_prev = float(rsi.iloc[-1]), float(rsi.iloc[-2])
         rsi_prev2 = float(rsi.iloc[-3]) if len(rsi) >= 3 else None
         if pd.isna(rsi_last) or pd.isna(rsi_prev):
-            self._record(symbol, regime="UP", regime_ema=regime_ema, rsi=None, rsi_prev=None,
+            self._record(symbol, regime=regime_label, regime_ema=regime_ema, rsi=None, rsi_prev=None,
                          trigger=False, signal="NEUTRAL", atr=current_atr_val,
                          reason="RSI not ready (NaN)")
             return "NEUTRAL", current_atr_val
         self.logger.debug(
-            f"{symbol}: rsi_dip regime UP, RSI(ltf)={rsi_last:.1f} (prev {rsi_prev:.1f}, "
-            f"oversold<{oversold})")
+            f"{symbol}: rsi_dip regime {regime_label}, RSI(ltf)={rsi_last:.1f} (prev {rsi_prev:.1f}, "
+            f"{'overbought>' if is_short else 'oversold<'}{overbought if is_short else oversold})")
 
         def _snap(reason, trigger, signal, extra=None):
-            st = {"regime": "UP", "regime_ema": regime_ema, "regime_price": float(htf["close"].iloc[-1]),
+            st = {"regime": regime_label, "regime_ema": regime_ema, "regime_price": float(htf["close"].iloc[-1]),
                   "regime_ema_value": float(ema_series.iloc[-1]), "rsi": round(rsi_last, 2),
                   "rsi_prev": round(rsi_prev, 2), "oversold": oversold, "trigger": trigger,
                   "signal": signal, "atr": current_atr_val, "reason": reason}
@@ -230,6 +242,20 @@ class SignalGenerator:
         if last_bucket_close != ltf_close_ms:
             _snap(f"waiting for the {self.config.get('RSI_TIMEFRAME', '1h')} bucket to close "
                   f"(last read {bucket_close_iso} UTC)", False, "NEUTRAL")
+            return "NEUTRAL", current_atr_val
+        # Short mirror: fire a SELL on an overbought RSI that has turned down.
+        # Entry-quality gates (ext/vol/RSI-floor/rise2) are long-shaped and stay
+        # off the short path in this prototype.
+        if is_short:
+            if rsi_last > overbought and rsi_last < rsi_prev:
+                _snap(f"rip confirmed: RSI {rsi_last:.1f} > {overbought} and falling (prev {rsi_prev:.1f})",
+                      True, "SELL")
+                return "SELL", current_atr_val
+            if rsi_last <= overbought:
+                _snap(f"RSI {rsi_last:.1f} <= overbought {overbought} — no rip", False, "NEUTRAL")
+            else:
+                _snap(f"RSI {rsi_last:.1f} > {overbought} but still rising (prev {rsi_prev:.1f})",
+                      False, "NEUTRAL")
             return "NEUTRAL", current_atr_val
         if rsi_last < oversold and rsi_last > rsi_prev:
             allowed, metrics, block = _entry_gates()

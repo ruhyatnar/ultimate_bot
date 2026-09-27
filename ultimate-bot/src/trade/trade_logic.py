@@ -512,7 +512,13 @@ class TradeLogic:
     # exits and orphan adoption all agree.
     # ------------------------------------------------------------------
     async def _futures_position_amount(self, symbol):
-        """positionAmt for symbol on futures (0.0 when flat/unavailable)."""
+        """ABSOLUTE positionAmt for symbol on futures (0.0 when flat/unavailable).
+
+        Magnitude, not sign: a position's direction lives in the trade's `side`
+        field, so a short (negative positionAmt on the exchange) reports its SIZE
+        here exactly like a long does. Returning the signed value made a short
+        look like a non-marketable position to reconciliation.
+        """
         try:
             rows = await self.rest.get_position_risk(symbol) or []
         except Exception:
@@ -520,7 +526,7 @@ class TradeLogic:
         for r in rows:
             if r.get("symbol") == symbol:
                 try:
-                    return float(r.get("positionAmt") or 0.0)
+                    return abs(float(r.get("positionAmt") or 0.0))
                 except (TypeError, ValueError):
                     return 0.0
         return 0.0
@@ -551,7 +557,8 @@ class TradeLogic:
             except (TypeError, ValueError):
                 continue
             if abs(amt) > 1e-12 and r.get("symbol"):
-                out[r["symbol"]] = amt
+                # Size is direction-agnostic here (see _futures_position_amount).
+                out[r["symbol"]] = abs(amt)
         return out
 
     async def _verify_recent_futures_qty(self, symbol, want_qty, window_ms):
@@ -791,8 +798,8 @@ class TradeLogic:
         if signal == "NEUTRAL":
             self.logger.debug(f"{symbol} signal NEUTRAL, skipping entry")
             return
-        if signal == "SELL":
-            self.logger.debug(f"{symbol} signal SELL (ignored in spot mode)")
+        if signal == "SELL" and not (self.is_futures and self.config.get("ALLOW_SHORTS", False)):
+            self.logger.debug(f"{symbol} signal SELL (shorts disabled or spot) — ignoring")
             return
         # Bucket latch: one BUY attempt per RSI bucket per symbol — a retry
         # inside the same bucket can only be a duplicate of a dead/resolving
@@ -805,26 +812,32 @@ class TradeLogic:
             self.logger.debug(f"{symbol}: BUY already attempted this RSI bucket; skipping re-fire.")
             return
         self._bucket_entry_latch[symbol] = int(time.time() * 1000 // bucket_ms)
-        self.logger.info(f"BUY signal for {symbol}, entering trade...")
+        self.logger.info(f"{signal} signal for {symbol}, entering trade...")
         await self.enter_trade(symbol, signal, atr)
         self.symbol_cooldowns[symbol] = time.time() + self.cooldown
 
-    def _compute_bracket(self, entry_price, atr=None):
-        """Bullish bracket (stop_price, take_profit) — delegated to the SHARED policy.
+    def _compute_bracket(self, entry_price, atr=None, side="long"):
+        """Bracket (stop_price, take_profit) — delegated to the SHARED policy.
 
         rsi_dip is the ONLY strategy. The bracket is built by
         `trade_policy.effective_bracket` — the exact function the backtest replays
-        — so the proven levels and the live levels can never disagree: fixed %
-        by default (SL_PERCENT / TP_PERCENT), or a volatility-adaptive ATR stop
-        when SL_ATR_MULTIPLIER > 0. The TP is floored at MIN_TP_PERCENT and
-        widened to MIN_RISK_REWARD so a tiny bracket can never be fee-negative.
+        — so the proven levels and the live levels can never disagree. Long: stop
+        below entry, TP above, sized from SL_PERCENT/TP_PERCENT. Short: the mirror
+        (stop above, TP below) from SHORT_SL_PERCENT/SHORT_TP_PERCENT. Both are
+        floored at MIN_TP_PERCENT and widened to MIN_RISK_REWARD.
         """
-        return effective_bracket(entry_price, self.config, atr)
+        return effective_bracket(entry_price, self.config, atr, side=side)
 
     async def enter_trade(self, symbol, signal, atr):
-        # Professional guard: only process bullish entries in spot mode.
-        if signal != "BUY":
-            self.logger.debug(f"{symbol}: enter_trade called with signal={signal}; spot bullish-only engine ignores it.")
+        # Direction gate. Long entries are always allowed (spot or futures); a SELL
+        # opens a SHORT only when the engine is on futures AND the operator armed
+        # ALLOW_SHORTS. Everything else is ignored exactly as before.
+        if signal == "BUY":
+            side, policy_side = "BUY", "long"
+        elif signal == "SELL" and self.is_futures and self.config.get("ALLOW_SHORTS", False):
+            side, policy_side = "SELL", "short"
+        else:
+            self.logger.debug(f"{symbol}: enter_trade called with signal={signal}; entry ignored.")
             return
         # Daily entry cap: reset the counter on a new UTC day, then block
         # further entries once MAX_TRADES_PER_DAY is reached (0 = unlimited).
@@ -851,9 +864,12 @@ class TradeLogic:
                 try:
                     px = await self.rest.get_premium_index(symbol)
                     fr = float((px if isinstance(px, dict) else {}).get("lastFundingRate", 0) or 0)
-                    if fr > fr_max:
+                    # A long pays a POSITIVE rate; a short pays a NEGATIVE one, so
+                    # each direction is capped on the sign it would actually pay.
+                    if (side == "BUY" and fr > fr_max) or (side == "SELL" and fr < -fr_max):
                         self.logger.info(
-                            f"{symbol}: funding {fr*100:.4f}% > cap {fr_max*100:.4f}% — long would pay; entry skipped.")
+                            f"{symbol}: funding {fr*100:.4f}% beyond the {side} cap "
+                            f"(±{fr_max*100:.4f}%) — entry would pay; skipped.")
                         return
                 except Exception as e:
                     # Unreadable funding must never block a proven setup.
@@ -867,8 +883,7 @@ class TradeLogic:
         # MIN_RISK_REWARD widening are applied inside the helper). Both legs are
         # software-managed MARKET exits, so both pay the taker fee — the backtest
         # models the same rate (no maker TP assumption).
-        stop_price, take_profit = self._compute_bracket(entry_price, atr)
-        side = "BUY"
+        stop_price, take_profit = self._compute_bracket(entry_price, atr, policy_side)
 
         # Hard cap total capital deployed (equity * BALANCE_USAGE_PERCENT).
         # Computed AFTER the live price is known so the cap shares the same benchmark.
@@ -878,7 +893,7 @@ class TradeLogic:
             self.logger.info(f"{symbol}: no remaining allocation headroom (${remaining:.2f}); skipping entry.")
             return
 
-        qty = await self.risk_mgr.calculate_position_size(symbol, entry_price, stop_price)
+        qty = await self.risk_mgr.calculate_position_size(symbol, entry_price, stop_price, side=policy_side)
         if not qty or qty <= 0:
             self.logger.info(f"{symbol}: position size 0 (equity/fee/minNotional caps) — entry skipped.")
             return
@@ -886,7 +901,8 @@ class TradeLogic:
         if qty * entry_price > remaining:
             self.logger.info(f"{symbol}: planned notional ${qty * entry_price:.2f} exceeds remaining allocation headroom ${remaining:.2f}; skipping entry.")
             return
-        order_id = await self.order_mgr.place_market_order(symbol, side, qty, expected_price=entry_price)
+        order_id = await self.order_mgr.place_market_order(symbol, side, qty, expected_price=entry_price,
+                                                           reduce_only=False)
         if order_id is None: return
         self._entries_today += 1
         await self._save_entry_cap()
@@ -907,7 +923,7 @@ class TradeLogic:
                         entry_price = avg_price
                         # Re-anchor the bracket on the ACTUAL fill price with the
                         # SAME policy math as the pre-trade bracket.
-                        stop_price, take_profit = self._compute_bracket(entry_price, atr)
+                        stop_price, take_profit = self._compute_bracket(entry_price, atr, policy_side)
                 except Exception as e:
                     self.logger.warning(f"Could not fetch avg fill price: {e}")
 
@@ -947,6 +963,8 @@ class TradeLogic:
 
     async def manage_trade(self, symbol):
         trade = self.active_trades[symbol]
+        # Direction of the position being managed (defaults long for legacy rows).
+        policy_side = "short" if trade.get("side") == "SELL" else "long"
         price = await self.ws_stream.get_current_price(symbol)
         if not price:
             try:
@@ -1005,6 +1023,7 @@ class TradeLogic:
             initial_stop_price=trade.get("initial_stop_price"),
             scale_out_done=trade.get("scale_out_done", False),
             eod=eod,
+            side=policy_side,
         )
         if plan.reason:
             if plan.reason == "EOD_CLOSE":
@@ -1027,12 +1046,16 @@ class TradeLogic:
         was_trailing = bool(trade.get("trailing_active"))
         was_breakeven = bool(trade.get("breakeven_activated"))
         prev_stop = float(trade["stop_price"])
+        # The favourable extreme is the bar HIGH for a long and the bar LOW for a
+        # short — the mirror observable the shared policy ratchets off.
+        _fav = low if policy_side == "short" else high
         updates = ratchet_stops(
-            trade["entry_price"], high, trade["stop_price"], self.config,
+            trade["entry_price"], _fav, trade["stop_price"], self.config,
             trailing_stop=trade.get("trailing_stop"),
             trailing_active=was_trailing,
             breakeven_activated=was_breakeven,
             atr=trade.get("atr"),
+            side=policy_side,
         )
         trade["stop_price"] = updates["stop_price"]
         trade["trailing_stop"] = updates["trailing_stop"]
@@ -1043,19 +1066,27 @@ class TradeLogic:
             self.logger.info(f"Breakeven locked for {symbol} at {trade['stop_price']:.4f} (fees covered).")
             await self.webhook.send(f"🛡️ Breakeven lock engaged for {symbol} at {trade['stop_price']:.4f} (fees covered).")
         if not was_trailing and updates["trailing_active"]:
-            profit_pct = (price - trade["entry_price"]) / trade["entry_price"]
+            profit_pct = ((trade["entry_price"] - price) if policy_side == "short"
+                          else (price - trade["entry_price"])) / trade["entry_price"]
             self.logger.info(f"Trailing stop activated for {symbol} at profit {profit_pct*100:.2f}%.")
-        elif updates["trailing_active"] and trade["trailing_stop"] > float(trade["stop_price"]):
-            self.logger.debug(f"{symbol}: trailing stop ratcheted to {trade['trailing_stop']:.6f} (hard stop {trade['stop_price']:.6f}).")
-        if trade["stop_price"] > prev_stop:
-            self.logger.debug(f"{symbol}: protective stop raised {prev_stop:.6f} → {trade['stop_price']:.6f}.")
+        elif updates["trailing_active"]:
+            # The active trail is the more protective of the two: higher for a
+            # long (stop sits below entry), lower for a short (stop above entry).
+            _tighter = (trade["trailing_stop"] < float(trade["stop_price"])) if policy_side == "short" \
+                else (trade["trailing_stop"] > float(trade["stop_price"]))
+            if _tighter:
+                self.logger.debug(f"{symbol}: trailing stop ratcheted to {trade['trailing_stop']:.6f} (hard stop {trade['stop_price']:.6f}).")
+        if trade["stop_price"] != prev_stop:
+            self.logger.debug(f"{symbol}: protective stop moved {prev_stop:.6f} → {trade['stop_price']:.6f}.")
 
         # The ratchet can itself reveal a breach: with an ATR trail (`new = high -
         # 2×ATR`) the raised stop can sit above the current tick when the favourable
         # extreme is well above it. The backtest catches that on its next bar, since
         # its decision also runs before the ratchet — this is the same rule evaluated
         # one cycle sooner, not a second one.
-        if trade["trailing_active"] and price <= trade["trailing_stop"]:
+        _trail_breached = (price >= trade["trailing_stop"]) if policy_side == "short" \
+            else (price <= trade["trailing_stop"])
+        if trade["trailing_active"] and _trail_breached:
             await self.close_trade(symbol, "TRAILING_STOP"); return
 
         await self._persist_active_trade_if_changed(symbol, trade)
@@ -1233,9 +1264,13 @@ class TradeLogic:
         if not trade:
             return
         original_qty = trade["quantity"]
+        # A short is closed by BUYing it back. Both closes carry reduceOnly so a
+        # sizing bug can never open the opposite exposure instead of flattening.
+        is_short = trade.get("side") == "SELL"
         try:
-            exit_side = "SELL"
-            exit_order_id = await self.order_mgr.place_market_order(symbol, exit_side, original_qty)
+            exit_side = "BUY" if is_short else "SELL"
+            exit_order_id = await self.order_mgr.place_market_order(
+                symbol, exit_side, original_qty, reduce_only=True)
             if exit_order_id is None:
                 # Failsafe: never silently drop a position we intended to close.
                 # Re-arm the stop locally and alert loudly — the next manage_trade pass
@@ -1326,7 +1361,8 @@ class TradeLogic:
         entry_cost = trade["entry_price"] * executed_qty
         exit_cost = fill_price * executed_qty
         total_fees = (entry_cost + exit_cost) * fee_rate
-        gross_pnl = (fill_price - trade["entry_price"]) * executed_qty
+        # A short profits when price FALLS, so its gross PnL is the mirrored sign.
+        gross_pnl = (-1.0 if is_short else 1.0) * (fill_price - trade["entry_price"]) * executed_qty
         pnl = gross_pnl - total_fees
         # ---- PnL auto-verification against the exchange's own books ----
         # Our model is an estimate; the exchange's realizedPnl − commission is
