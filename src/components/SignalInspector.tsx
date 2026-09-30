@@ -7,7 +7,8 @@ import {
   Target,
   CheckCircle,
   XCircle,
-  Info
+  Info,
+  TrendingDown
 } from 'lucide-react';
 import { MarketSymbolData, BotConfig } from '../types';
 
@@ -23,6 +24,8 @@ interface SignalInspectorProps {
  * exact code the engine trades with.
  */
 export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, config }) => {
+  const allowShorts = config.allowShorts ?? false;
+
   return (
     <div className="space-y-6">
       {/* Intro Header */}
@@ -37,10 +40,22 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-1 max-w-3xl">
-              A BUY fires only when the <strong>daily EMA-{config.regimeEma} regime</strong> is up (close above the EMA and the EMA rising
+              A <strong>BUY</strong> fires when the <strong>daily EMA-{config.regimeEma} regime</strong> is up (close above the EMA and the EMA rising
               over {config.regimeSlopeDays} days) <strong>and</strong> RSI({config.rsiPeriod}) on {config.timeframe} closes, sampled at each
-              closed {config.rsiTimeframe} bucket, dips below <strong>{config.rsiOversold}</strong> and turns up. Exits are the fixed{' '}
-              <strong>-{(config.slPercent * 100).toFixed(2)}% / +{(config.tpPercent * 100).toFixed(2)}%</strong> bracket.
+              closed {config.rsiTimeframe} bucket, dips below <strong>{config.rsiOversold}</strong> and turns up.
+              {allowShorts && (
+                <>
+                  A <strong>SELL (short)</strong> fires in a confirmed downtrend (price below a falling EMA) when RSI rises above
+                  <strong>{config.shortRsiOverbought ?? 60}</strong> and turns down. Exits are the fixed{' '}
+                  <strong>-{(config.slPercent * 100).toFixed(2)}% / +{(config.tpPercent * 100).toFixed(2)}%</strong> bracket (long) and
+                  <strong>+{(config.shortSlPercent * 100).toFixed(2)}% / -{(config.shortTpPercent * 100).toFixed(2)}%</strong> bracket (short).
+                </>
+              )}
+              {!allowShorts && (
+                <>
+                  Exits are the fixed <strong>-{(config.slPercent * 100).toFixed(2)}% / +{(config.tpPercent * 100).toFixed(2)}%</strong> bracket.
+                </>
+              )}
             </p>
           </div>
 
@@ -79,11 +94,16 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
         {symbolsData.map(sym => {
           const s = sym.signal;
           const isBuy = s.trigger && s.signal === 'BUY';
+          const isShort = s.trigger && s.signal === 'SELL';
+          const isTrigger = isBuy || isShort;
           const regimeUp = s.regime === 'UP';
+          const regimeDown = s.regime === 'DOWN';
           const rsiKnown = s.rsi !== null && s.rsi !== undefined;
+          const oversold = s.oversold ?? config.rsiOversold;
+          const overbought = s.overbought ?? config.shortRsiOverbought ?? 60;
           const rsiColor = !rsiKnown
             ? 'text-slate-300'
-            : (s.rsi as number) < (s.oversold ?? config.rsiOversold)
+            : ((s.rsi as number) < oversold || (isShort && (s.rsi as number) > overbought))
               ? 'text-amber-300'
               : 'text-slate-200';
 
@@ -91,7 +111,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
             <div
               key={sym.symbol}
               className={`rounded-xl border p-5 transition-all shadow-sm ${
-                isBuy
+                isTrigger
                   ? 'bg-gradient-to-b from-slate-800 to-emerald-950/20 border-emerald-500/40'
                   : 'bg-slate-800/90 border-slate-700/60'
               }`}
@@ -109,7 +129,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                 </div>
 
                 <div className={`px-3 py-1 rounded-lg text-xs font-bold flex items-center space-x-1.5 ${
-                  isBuy
+                  isTrigger
                     ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                     : 'bg-slate-700/50 text-slate-300 border border-slate-600/50'
                 }`}>
@@ -117,6 +137,11 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                     <>
                       <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
                       <span>BUY TRIGGER</span>
+                    </>
+                  ) : isShort ? (
+                    <>
+                      <TrendingDown className="w-3.5 h-3.5 text-rose-400" />
+                      <span>SHORT TRIGGER</span>
                     </>
                   ) : (
                     <>
@@ -136,7 +161,9 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                     <div>
                       <span className="font-semibold text-slate-200">1. Daily Regime (EMA-{s.regime_ema ?? config.regimeEma})</span>
                       <p className="text-[11px] text-slate-400">
-                        Close above EMA and EMA rising over {config.regimeSlopeDays}d
+                        {regimeDown
+                          ? `Price below EMA and EMA falling over {config.regimeSlopeDays}d (short regime)`
+                          : `Close above EMA and EMA rising over {config.regimeSlopeDays}d (long regime)`}
                         {s.regime_price !== undefined && s.regime_ema_value !== undefined
                           ? ` • ${s.regime_price.toFixed(6)} vs ${s.regime_ema_value.toFixed(6)}`
                           : ''}
@@ -147,7 +174,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                     <span className={`px-2 py-0.5 rounded font-bold text-[11px] ${
                       regimeUp
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                        : s.regime === 'DOWN'
+                        : regimeDown
                           ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                           : 'bg-slate-700 text-slate-300'
                     }`}>
@@ -156,14 +183,20 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                   </div>
                 </div>
 
-                {/* 2. RSI dip trigger */}
+                {/* 2. RSI trigger */}
                 <div className="flex items-center justify-between p-2.5 rounded-lg bg-slate-900/60 border border-slate-700/40 text-xs">
                   <div className="flex items-center space-x-2">
                     <Gauge className="w-4 h-4 text-amber-400" />
                     <div>
-                      <span className="font-semibold text-slate-200">2. RSI({s.rsi_period ?? config.rsiPeriod}) Dip on {s.rsi_timeframe ?? config.rsiTimeframe}</span>
+                      <span className="font-semibold text-slate-200">
+                        {isShort || regimeDown
+                          ? `2. RSI({s.rsi_period ?? config.rsiPeriod}) Rip on {s.rsi_timeframe ?? config.rsiTimeframe} (SHORT)`
+                          : `2. RSI({s.rsi_period ?? config.rsiPeriod}) Dip on {s.rsi_timeframe ?? config.rsiTimeframe} (LONG)`}
+                      </span>
                       <p className="text-[11px] text-slate-400">
-                        Trigger when RSI &lt; {s.oversold ?? config.rsiOversold} and rising
+                        {isShort || regimeDown
+                          ? `Trigger when RSI > ${overbought} and falling`
+                          : `Trigger when RSI < ${oversold} and rising`}
                         {s.rsi_prev !== null && s.rsi_prev !== undefined ? ` • prev ${s.rsi_prev}` : ''}
                       </p>
                     </div>
@@ -185,9 +218,19 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                     </div>
                   </div>
                   <div className="text-right font-mono text-[11px]">
-                    <span className="text-rose-300">-{(config.slPercent * 100).toFixed(2)}%</span>
-                    <span className="text-slate-500"> / </span>
-                    <span className="text-emerald-300">+{(config.tpPercent * 100).toFixed(2)}%</span>
+                    {isShort ? (
+                      <>
+                        <span className="text-rose-300">+{(config.shortSlPercent * 100).toFixed(2)}% SL</span>
+                        <span className="text-slate-500"> / </span>
+                        <span className="text-emerald-300">-{(config.shortTpPercent * 100).toFixed(2)}% TP</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="text-rose-300">-{(config.slPercent * 100).toFixed(2)}%</span>
+                        <span className="text-slate-500"> / </span>
+                        <span className="text-emerald-300">+{(config.tpPercent * 100).toFixed(2)}%</span>
+                      </>
+                    )}
                   </div>
                 </div>
 
@@ -212,7 +255,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                 <Info className="w-4 h-4 text-slate-400 mt-0.5 shrink-0" />
                 <div>
                   <span className="font-semibold text-slate-300">Engine reason: </span>
-                  <span className={isBuy ? 'text-emerald-300 font-medium' : 'text-slate-400'}>
+                  <span className={isTrigger ? 'text-emerald-300 font-medium' : 'text-slate-400'}>
                     {s.reason || '—'}
                   </span>
                 </div>

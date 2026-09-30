@@ -89,10 +89,15 @@ const DEFAULT_CONFIG: BotConfig = {
   strategyMode: 'rsi_dip',
   slPercent: 0.012,
   tpPercent: 0.03,
-  rsiPeriod: 7,
+  rsiPeriod: 14,
   rsiOversold: 40,
   entryRsiMin: 35,
   trailingAtrMultiplier: 2,
+  // --- short-side mirror (futures only; gated by allowShorts) ---
+  allowShorts: false,
+  shortRsiOverbought: 60,
+  shortSlPercent: 0.012,
+  shortTpPercent: 0.03,
   entryMaxExtAtr: 0,
   entryExtEma: 20,
   entryVolMult: 0,
@@ -166,6 +171,8 @@ const offlineSignal = (symbol: string): SignalState => ({
   regime: 'NO_DATA',
   rsi: null,
   rsi_prev: null,
+  oversold: 40,
+  overbought: 60,
   trigger: false,
   signal: 'NEUTRAL',
   reason: 'engine has not published a signal snapshot for this pair yet'
@@ -189,7 +196,8 @@ const NUMERIC_CONFIG_KEYS: ReadonlyArray<keyof BotConfig> = [
   'cooldownLoss', 'cooldownWin', 'balanceUsagePercent',
   'lossReentryCooldown',
   'maxSymbolAllocationPercent', 'maxSymbols', 'adxThreshold', 'adxPeriod',
-  'futuresLeverage', 'soakStallSeconds', 'tickersRestFallbackSeconds'
+  'futuresLeverage', 'soakStallSeconds', 'tickersRestFallbackSeconds',
+  'shortRsiOverbought', 'shortSlPercent', 'shortTpPercent'
 ];
 
 export const sanitizeConfigUpdate = (next: BotConfig, current: BotConfig): BotConfig => {

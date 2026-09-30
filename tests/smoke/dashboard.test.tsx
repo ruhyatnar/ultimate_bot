@@ -90,6 +90,11 @@ const baseConfig: BotConfig = {
   tickersRestFallbackSeconds: 60,
   discordWebhookUrl: '',
   logLevel: 'INFO',
+  // short-side mirror
+  allowShorts: false,
+  shortRsiOverbought: 60,
+  shortSlPercent: 0.012,
+  shortTpPercent: 0.03,
 };
 
 const signal = (over: Partial<MarketSymbolData['signal']> = {}) => ({

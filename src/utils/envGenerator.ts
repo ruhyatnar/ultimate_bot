@@ -70,6 +70,12 @@ BREAKEVEN_OFFSET=${config.breakevenOffset}
 CLOSE_AT_UTC_DAY_END=${config.closeAtUtcDayEnd}
 MIN_TP_PERCENT=${config.minTpPercent}
 
+# --- Short-side mirror (futures only; gated by ALLOW_SHORTS) ---
+ALLOW_SHORTS=${config.allowShorts}
+SHORT_RSI_OVERBOUGHT=${config.shortRsiOverbought}
+SHORT_SL_PERCENT=${config.shortSlPercent}
+SHORT_TP_PERCENT=${config.shortTpPercent}
+
 # --- Execution ---
 TIMEFRAME=${config.timeframe}
 MTF_TIMEFRAME=${config.mtfTimeframe}

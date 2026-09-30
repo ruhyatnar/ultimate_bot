@@ -143,6 +143,77 @@ export const ConfigTab: React.FC<ConfigTabProps> = ({
                 </div>
               )}
 
+              {config.market === 'futures' && config.allowShorts && (
+                <div className="bg-rose-900/30 border border-rose-500/30 rounded-lg p-3">
+                  <div className="flex items-center space-x-2 text-[10px] text-rose-300 mb-2">
+                    <Zap className="w-3.5 h-3.5" />
+                    <span className="font-bold">SHORT MODE ENABLED</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                    <div>
+                      <label className="font-semibold text-slate-200 block mb-1">
+                        Short RSI Overbought ({config.shortRsiOverbought})
+                      </label>
+                      <input
+                        type="number"
+                        step={1}
+                        min={50}
+                        max={80}
+                        value={config.shortRsiOverbought}
+                        onChange={e => handleChange('shortRsiOverbought', parseInt(e.target.value, 10))}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs"
+                      />
+                      <p className="text-[10px] text-slate-500 mt-1">Trigger SELL when RSI {'>'} this and falling in a downtrend.</p>
+                    </div>
+
+                    <div>
+                      <label className="font-semibold text-slate-200 block mb-1">
+                        Short Stop Loss (+{(config.shortSlPercent * 100).toFixed(2)}% above entry)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.001"
+                        min="0.004"
+                        max="0.1"
+                        value={config.shortSlPercent}
+                        onChange={e => handleChange('shortSlPercent', parseFloat(e.target.value))}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="font-semibold text-slate-200 block mb-1">
+                        Short Take Profit (-{(config.shortTpPercent * 100).toFixed(2)}% below entry)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.001"
+                        min="0.01"
+                        max="0.2"
+                        value={config.shortTpPercent}
+                        onChange={e => handleChange('shortTpPercent', parseFloat(e.target.value))}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="font-semibold text-slate-200 block mb-1">
+                        Allow Shorts
+                      </label>
+                      <div className="flex items-center space-x-2">
+                        <input
+                          type="checkbox"
+                          checked={config.allowShorts}
+                          onChange={e => handleChange('allowShorts', e.target.checked)}
+                          className="accent-rose-500"
+                        />
+                        <span className="text-[11px] text-slate-300">Enable SELL signal in confirmed downtrend (futures only)</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div>
                 <label className="font-semibold text-slate-200 block mb-1">
                   Soak Stall Alert ({config.soakStallSeconds}s)

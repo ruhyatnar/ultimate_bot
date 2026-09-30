@@ -177,7 +177,7 @@ class SignalGenerator:
         def _snap(reason, trigger, signal, extra=None):
             st = {"regime": regime_label, "regime_ema": regime_ema, "regime_price": float(htf["close"].iloc[-1]),
                   "regime_ema_value": float(ema_series.iloc[-1]), "rsi": round(rsi_last, 2),
-                  "rsi_prev": round(rsi_prev, 2), "oversold": oversold, "trigger": trigger,
+                  "rsi_prev": round(rsi_prev, 2), "oversold": oversold, "overbought": overbought, "trigger": trigger,
                   "signal": signal, "atr": current_atr_val, "reason": reason}
             if extra:
                 st.update(extra)

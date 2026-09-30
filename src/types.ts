@@ -19,6 +19,11 @@ export interface BotConfig {
   rsiOversold: number;
   entryRsiMin: number;        // RSI floor gate: skip entries when RSI < this (0 = off)
   trailingAtrMultiplier: number; // ATR-scaled trail distance (0 = use % callback)
+  // --- short-side mirror (futures only; gated by ALLOW_SHORTS) ---
+  allowShorts: boolean;       // enable symmetric SELL signal in downtrend
+  shortRsiOverbought: number; // RSI threshold for short rip trigger
+  shortSlPercent: number;     // fixed SL bracket for shorts (positive = stop above entry)
+  shortTpPercent: number;     // fixed TP bracket for shorts (positive = target below entry)
   // --- optional entry quality gates (all off by default; see SignalGenerator) ---
   entryMaxExtAtr: number;     // skip entries when close > N×ATR above the extension EMA (0 = off)
   entryExtEma: number;        // EMA span used by the extension measure
@@ -86,10 +91,11 @@ export interface SignalState {
   rsi: number | null;
   rsi_prev: number | null;
   oversold?: number;
+  overbought?: number;
   rsi_period?: number;
   rsi_timeframe?: string;
   trigger: boolean;
-  signal: 'BUY' | 'NEUTRAL';
+  signal: 'BUY' | 'SELL' | 'NEUTRAL';
   atr?: number;
   reason: string;
 }
