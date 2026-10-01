@@ -829,10 +829,11 @@ export default function App() {
           rsi: s.rsi === null || s.rsi === undefined ? null : Number(s.rsi),
           rsi_prev: s.rsi_prev === null || s.rsi_prev === undefined ? null : Number(s.rsi_prev),
           oversold: s.oversold,
+          overbought: s.overbought,
           rsi_period: s.rsi_period,
           rsi_timeframe: s.rsi_timeframe,
           trigger: Boolean(s.trigger),
-          signal: s.signal === 'BUY' ? 'BUY' : 'NEUTRAL',
+          signal: (s.signal === 'BUY' || s.signal === 'SELL') ? s.signal : 'NEUTRAL',
           atr: s.atr,
           reason: s.reason || ''
         };
