@@ -140,6 +140,8 @@ def main():
             "DYNAMIC_SYMBOLS": "false",
             "MAX_SYMBOLS": "2",
             "SIGNAL_INTERVAL": "10",
+            # Shorts require MARKET=futures; explicitly disable for spot sync test
+            "ALLOW_SHORTS": "false",
         }
     )
     engine_log = os.path.join(tmp, "engine.stdout.log")

@@ -124,6 +124,8 @@ def main():
             # Pin the market: the tests exercise the proven spot path even when the
             # live engine on this box is running MARKET=futures.
             "MARKET": "spot",
+            # Shorts require MARKET=futures; explicitly disable for spot smoke test
+            "ALLOW_SHORTS": "false",
         }
     )
     engine_log = os.path.join(tmp, "engine.stdout.log")
