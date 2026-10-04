@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { MarketSymbolData, BotConfig } from '../types';
 import { effectiveAllocation, MIN_NOTIONAL_USDT } from '../utils/envGenerator';
+import { deriveSignalMode, fixedBracket } from '../utils/signalMode';
 
 interface SymbolDetailModalProps {
   symbolData: MarketSymbolData;
@@ -26,15 +27,18 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
 }) => {
   const s = symbolData.signal;
   const price = symbolData.price;
-  const regimeUp = s.regime === 'UP';
-  const isBuy = s.trigger && s.signal === 'BUY';
-  const rsiKnown = s.rsi !== null && s.rsi !== undefined;
+  // Direction + thresholds come from the shared helper (see SignalMode), the
+  // same call the Signal State card makes, so the two surfaces cannot drift: the
+  // engine sets `is_short = regime_down` (reachable only with ALLOW_SHORTS armed),
+  // so the ACTIVE DIRECTION is a property of the regime — not of whether a signal
+  // has already fired.
+  const {
+    regimeUp, isBuy, isShort, shortMode, blockedMode, rsiKnown, oversold, overbought
+  } = deriveSignalMode(s, config);
 
-  // Fixed-% bracket — the exact math trade_logic._compute_bracket applies.
-  const stopLoss = price > 0 ? price * (1 - config.slPercent) : 0;
-  let takeProfit = price > 0 ? price * (1 + config.tpPercent) : 0;
-  const minTpDist = price * config.minTpPercent;
-  if (takeProfit - price < minTpDist) takeProfit = price + minTpDist;
+  // Fixed-% bracket — the shared mirrored math (stop ABOVE / TP BELOW for a
+  // short, with the MIN_TP_PERCENT floor on the profitable leg).
+  const { slFrac, tpFrac, stopLoss, takeProfit } = fixedBracket(config, price, shortMode);
 
   const maxAlloc = Math.round(effectiveAllocation(config, equity));
   const estimatedQuantity = price > 0 ? maxAlloc / price : 0;
@@ -57,7 +61,7 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
                   {symbolData.priceChange24h >= 0 ? '+' : ''}{symbolData.priceChange24h.toFixed(2)}%
                 </span>
               </div>
-              <p className="text-xs text-slate-400">{symbolData.name} • Binance Spot Market</p>
+              <p className="text-xs text-slate-400">{symbolData.name} • {config.market === 'futures' ? 'Binance USDⓈ-M Futures' : 'Binance Spot Market'}</p>
             </div>
           </div>
 
@@ -84,7 +88,9 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
           <div className={`p-4 rounded-xl border ${
             isBuy
               ? 'bg-emerald-950/30 border-emerald-500/40 text-emerald-200'
-              : 'bg-slate-800/60 border-slate-700/60 text-slate-300'
+              : isShort
+                ? 'bg-rose-950/30 border-rose-500/40 text-rose-200'
+                : 'bg-slate-800/60 border-slate-700/60 text-slate-300'
           }`}>
             <div className="flex items-center justify-between">
               <div>
@@ -93,11 +99,23 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
                   <span className={`px-2 py-0.5 rounded text-xs font-bold ${
                     isBuy
                       ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                      : regimeUp
-                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                        : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                      : isShort
+                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                        : regimeUp
+                          ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                          : 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                   }`}>
-                    {isBuy ? 'READY TO BUY' : regimeUp ? 'REGIME UP — WAITING FOR DIP' : `REGIME ${s.regime}`}
+                    {isBuy
+                      ? 'READY TO BUY'
+                      : isShort
+                        ? 'READY TO SHORT'
+                        : shortMode
+                          ? 'SHORT REGIME — WAITING FOR RIP'
+                          : regimeUp
+                            ? 'REGIME UP — WAITING FOR DIP'
+                            : blockedMode
+                              ? `REGIME ${s.regime} — NO ENTRY`
+                              : `REGIME ${s.regime}`}
                   </span>
                 </div>
                 <p className="text-xs text-slate-300 mt-1 max-w-md">{s.reason || 'No reason published yet.'}</p>
@@ -107,7 +125,9 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
                 <div className="text-3xl font-bold font-mono text-slate-100">
                   {rsiKnown ? (s.rsi as number).toFixed(1) : '—'}
                 </div>
-                <div className="text-[10px] text-slate-400">&lt; {s.oversold ?? config.rsiOversold} = dip</div>
+                <div className="text-[10px] text-slate-400">
+                  {shortMode ? `> ${overbought} = rip` : `< ${oversold} = dip`}
+                </div>
               </div>
             </div>
           </div>
@@ -124,7 +144,8 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
                 <div>
                   <div className="font-semibold text-slate-200">1. Daily Regime EMA-{s.regime_ema ?? config.regimeEma}</div>
                   <div className="text-[11px] text-slate-400 mt-0.5">
-                    Close vs EMA{s.regime_price !== undefined && s.regime_ema_value !== undefined
+                    {shortMode ? 'Short regime: close below a falling EMA' : 'Close vs EMA'}
+                    {s.regime_price !== undefined && s.regime_ema_value !== undefined
                       ? ` • ${s.regime_price.toPrecision(6)} / ${s.regime_ema_value.toPrecision(6)}`
                       : ''}
                   </div>
@@ -132,6 +153,10 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
                 {regimeUp ? (
                   <span className="text-emerald-400 flex items-center space-x-1 font-bold">
                     <CheckCircle2 className="w-4 h-4" /><span>UP</span>
+                  </span>
+                ) : shortMode ? (
+                  <span className="text-rose-400 flex items-center space-x-1 font-bold">
+                    <CheckCircle2 className="w-4 h-4" /><span>SHORT</span>
                   </span>
                 ) : (
                   <span className="text-slate-400 flex items-center space-x-1 font-bold">
@@ -142,7 +167,7 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
 
               <div className="bg-slate-800/60 p-3 rounded-lg border border-slate-700/50 flex items-center justify-between">
                 <div>
-                  <div className="font-semibold text-slate-200">2. RSI Dip &amp; Turn</div>
+                  <div className="font-semibold text-slate-200">{shortMode ? '2. RSI Rip & Turn' : '2. RSI Dip & Turn'}</div>
                   <div className="text-[11px] text-slate-400 mt-0.5">
                     {rsiKnown ? `now ${(s.rsi as number).toFixed(2)}` : 'not ready'}
                     {s.rsi_prev !== null && s.rsi_prev !== undefined ? ` • prev ${s.rsi_prev}` : ''}
@@ -154,7 +179,8 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
                   </span>
                 ) : (
                   <span className="text-slate-400 flex items-center space-x-1 font-bold">
-                    <XCircle className="w-4 h-4 text-slate-500" /><span>No dip</span>
+                    <XCircle className="w-4 h-4 text-slate-500" />
+                    <span>{shortMode ? 'No rip' : blockedMode ? 'Not evaluated' : 'No dip'}</span>
                   </span>
                 )}
               </div>
@@ -177,7 +203,7 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
           <div className="bg-slate-800/40 p-4 rounded-xl border border-slate-700/60 space-y-3">
             <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center space-x-1.5">
               <Crosshair className="w-3.5 h-3.5 text-amber-400" />
-              <span>Fixed % Bracket &amp; Sizing</span>
+              <span>{shortMode ? 'Fixed % Bracket & Sizing (SHORT mirror)' : 'Fixed % Bracket & Sizing'}</span>
             </h4>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
@@ -186,11 +212,19 @@ export const SymbolDetailModal: React.FC<SymbolDetailModalProps> = ({
                 <span className="text-slate-100 font-bold">{price > 0 ? `$${price.toFixed(price < 10 ? 6 : 2)}` : '—'}</span>
               </div>
               <div className="bg-slate-900/70 p-2.5 rounded-lg border border-slate-800">
-                <span className="text-rose-400 block text-[10px]">Stop -{(config.slPercent * 100).toFixed(2)}%</span>
+                <span className="text-rose-400 block text-[10px]">
+                  {shortMode
+                    ? `Stop +${(slFrac * 100).toFixed(2)}% (above)`
+                    : `Stop -${(slFrac * 100).toFixed(2)}%`}
+                </span>
                 <span className="text-rose-400 font-bold">{stopLoss > 0 ? `$${stopLoss.toFixed(stopLoss < 10 ? 6 : 2)}` : '—'}</span>
               </div>
               <div className="bg-slate-900/70 p-2.5 rounded-lg border border-slate-800">
-                <span className="text-emerald-400 block text-[10px]">Take Profit +{(config.tpPercent * 100).toFixed(2)}%</span>
+                <span className="text-emerald-400 block text-[10px]">
+                  {shortMode
+                    ? `Take Profit -${(tpFrac * 100).toFixed(2)}% (below)`
+                    : `Take Profit +${(tpFrac * 100).toFixed(2)}%`}
+                </span>
                 <span className="text-emerald-400 font-bold">{takeProfit > 0 ? `$${takeProfit.toFixed(takeProfit < 10 ? 6 : 2)}` : '—'}</span>
               </div>
               <div className="bg-slate-900/70 p-2.5 rounded-lg border border-slate-800">

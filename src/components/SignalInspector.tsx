@@ -11,6 +11,7 @@ import {
   TrendingDown
 } from 'lucide-react';
 import { MarketSymbolData, BotConfig } from '../types';
+import { deriveSignalMode, bracketFracs } from '../utils/signalMode';
 
 interface SignalInspectorProps {
   symbolsData: MarketSymbolData[];
@@ -25,6 +26,10 @@ interface SignalInspectorProps {
  */
 export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, config }) => {
   const allowShorts = config.allowShorts ?? false;
+  // Bracket copy in the intro uses one direction each; take the fractions from
+  // the shared helper so a config rename cannot desync the header from the cards.
+  const longBracket = bracketFracs(config, false);
+  const shortBracket = bracketFracs(config, true);
 
   return (
     <div className="space-y-6">
@@ -47,13 +52,13 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                 <>
                   A <strong>SELL (short)</strong> fires in a confirmed downtrend (price below a falling EMA) when RSI rises above
                   <strong>{config.shortRsiOverbought ?? 60}</strong> and turns down. Exits are the fixed{' '}
-                  <strong>-{(config.slPercent * 100).toFixed(2)}% / +{(config.tpPercent * 100).toFixed(2)}%</strong> bracket (long) and
-                  <strong>+{(config.shortSlPercent * 100).toFixed(2)}% / -{(config.shortTpPercent * 100).toFixed(2)}%</strong> bracket (short).
+                  <strong>-{(longBracket.slFrac * 100).toFixed(2)}% / +{(longBracket.tpFrac * 100).toFixed(2)}%</strong> bracket (long) and
+                  <strong>+{(shortBracket.slFrac * 100).toFixed(2)}% / -{(shortBracket.tpFrac * 100).toFixed(2)}%</strong> bracket (short).
                 </>
               )}
               {!allowShorts && (
                 <>
-                  Exits are the fixed <strong>-{(config.slPercent * 100).toFixed(2)}% / +{(config.tpPercent * 100).toFixed(2)}%</strong> bracket.
+                  Exits are the fixed <strong>-{(longBracket.slFrac * 100).toFixed(2)}% / +{(longBracket.tpFrac * 100).toFixed(2)}%</strong> bracket.
                 </>
               )}
             </p>
@@ -93,19 +98,46 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
         {symbolsData.map(sym => {
           const s = sym.signal;
-          const isBuy = s.trigger && s.signal === 'BUY';
-          const isShort = s.trigger && s.signal === 'SELL';
-          const isTrigger = isBuy || isShort;
-          const regimeUp = s.regime === 'UP';
-          const regimeDown = s.regime === 'DOWN';
-          const rsiKnown = s.rsi !== null && s.rsi !== undefined;
-          const oversold = s.oversold ?? config.rsiOversold;
-          const overbought = s.overbought ?? config.shortRsiOverbought ?? 60;
+          // Direction + thresholds come from the shared helper (see SignalMode)
+          // so this card and the detail modal can never disagree about which side
+          // the engine is on — the ACTIVE DIRECTION is the regime, not the trigger.
+          const {
+            isBuy, isShort, isTrigger, regimeUp, regimeDown,
+            shortMode, blockedMode, priceBelowEma, rsiKnown, oversold, overbought
+          } = deriveSignalMode(s, config);
+          const { slFrac, tpFrac } = bracketFracs(config, shortMode);
           const rsiColor = !rsiKnown
             ? 'text-slate-300'
-            : ((s.rsi as number) < oversold || (isShort && (s.rsi as number) > overbought))
+            : (shortMode ? (s.rsi as number) > overbought : (s.rsi as number) < oversold)
               ? 'text-amber-300'
               : 'text-slate-200';
+
+          // Gate copy, written once. These were template literals using `{...}`
+          // instead of `${...}`, so the operator saw the raw placeholder text
+          // (e.g. "RSI({s.rsi_period ?? config.rsiPeriod}) Dip on ...").
+          const regimeCopy = regimeUp
+            ? `Close above EMA and EMA rising over ${config.regimeSlopeDays}d (long regime)`
+            : shortMode
+              ? priceBelowEma === false
+                ? `Price at/above EMA — no falling regime, so no short either`
+                : `Price below EMA and EMA falling over ${config.regimeSlopeDays}d (short regime)`
+              : blockedMode
+                ? `Regime not up over ${config.regimeSlopeDays}d — long entries blocked, no short armed`
+                : `Waiting for enough completed ${config.mtfTimeframe} regime candles`;
+          const rsiTitle = shortMode
+            ? `2. RSI(${s.rsi_period ?? config.rsiPeriod}) Rip on ${s.rsi_timeframe ?? config.rsiTimeframe} (SHORT)`
+            : regimeUp
+              ? `2. RSI(${s.rsi_period ?? config.rsiPeriod}) Dip on ${s.rsi_timeframe ?? config.rsiTimeframe} (LONG)`
+              : blockedMode
+                ? `2. RSI(${s.rsi_period ?? config.rsiPeriod}) — not evaluated (no entry)`
+                : `2. RSI(${s.rsi_period ?? config.rsiPeriod}) — waiting for the regime`;
+          const rsiCopy = shortMode
+            ? `Trigger when RSI > ${overbought} and falling`
+            : regimeUp
+              ? `Trigger when RSI < ${oversold} and rising`
+              : blockedMode
+                ? `Long entries blocked in a non-up regime — arm ALLOW_SHORTS for the short mirror`
+                : `The regime gate has not produced a completed read yet`;
 
           return (
             <div
@@ -161,9 +193,7 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                     <div>
                       <span className="font-semibold text-slate-200">1. Daily Regime (EMA-{s.regime_ema ?? config.regimeEma})</span>
                       <p className="text-[11px] text-slate-400">
-                        {regimeDown
-                          ? `Price below EMA and EMA falling over {config.regimeSlopeDays}d (short regime)`
-                          : `Close above EMA and EMA rising over {config.regimeSlopeDays}d (long regime)`}
+                        {regimeCopy}
                         {s.regime_price !== undefined && s.regime_ema_value !== undefined
                           ? ` • ${s.regime_price.toFixed(6)} vs ${s.regime_ema_value.toFixed(6)}`
                           : ''}
@@ -188,15 +218,10 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                   <div className="flex items-center space-x-2">
                     <Gauge className="w-4 h-4 text-amber-400" />
                     <div>
-                      <span className="font-semibold text-slate-200">
-                        {isShort || regimeDown
-                          ? `2. RSI({s.rsi_period ?? config.rsiPeriod}) Rip on {s.rsi_timeframe ?? config.rsiTimeframe} (SHORT)`
-                          : `2. RSI({s.rsi_period ?? config.rsiPeriod}) Dip on {s.rsi_timeframe ?? config.rsiTimeframe} (LONG)`}
-                      </span>
+                      <span className="font-semibold text-slate-200">{rsiTitle}</span>
                       <p className="text-[11px] text-slate-400">
-                        {isShort || regimeDown
-                          ? `Trigger when RSI > ${overbought} and falling`
-                          : `Trigger when RSI < ${oversold} and rising`}
+                        {rsiCopy}
+                        {shortMode && !isShort ? ' • armed — awaiting the rip' : ''}
                         {s.rsi_prev !== null && s.rsi_prev !== undefined ? ` • prev ${s.rsi_prev}` : ''}
                       </p>
                     </div>
@@ -218,17 +243,17 @@ export const SignalInspector: React.FC<SignalInspectorProps> = ({ symbolsData, c
                     </div>
                   </div>
                   <div className="text-right font-mono text-[11px]">
-                    {isShort ? (
+                    {shortMode ? (
                       <>
-                        <span className="text-rose-300">+{(config.shortSlPercent * 100).toFixed(2)}% SL</span>
+                        <span className="text-rose-300">+{(slFrac * 100).toFixed(2)}% SL</span>
                         <span className="text-slate-500"> / </span>
-                        <span className="text-emerald-300">-{(config.shortTpPercent * 100).toFixed(2)}% TP</span>
+                        <span className="text-emerald-300">-{(tpFrac * 100).toFixed(2)}% TP</span>
                       </>
                     ) : (
                       <>
-                        <span className="text-rose-300">-{(config.slPercent * 100).toFixed(2)}%</span>
+                        <span className="text-rose-300">-{(slFrac * 100).toFixed(2)}%</span>
                         <span className="text-slate-500"> / </span>
-                        <span className="text-emerald-300">+{(config.tpPercent * 100).toFixed(2)}%</span>
+                        <span className="text-emerald-300">+{(tpFrac * 100).toFixed(2)}%</span>
                       </>
                     )}
                   </div>

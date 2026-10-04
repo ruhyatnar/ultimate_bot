@@ -15,6 +15,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import App from '../../src/App';
 import { LiveDashboard } from '../../src/components/LiveDashboard';
 import { SignalInspector } from '../../src/components/SignalInspector';
+import { SymbolDetailModal } from '../../src/components/SymbolDetailModal';
 import { DebugConsole } from '../../src/components/DebugConsole';
 import { ConfigTab } from '../../src/components/ConfigTab';
 import { DeployGuide } from '../../src/components/DeployGuide';
@@ -803,4 +804,128 @@ test('a multi-line record renders as lines in the console', () => {
   assert.match(html, /Futures REST error 400/);
   assert.match(html, /Traceback \(most recent call last\)/);
   assert.match(html, /File &quot;x\.py&quot;, line 1/);
+});
+
+// ─── Signal State tab: the card must state the ENGINE's direction ───────────
+//
+// Two defects shipped in this card. (1) The gate copy was a template literal
+// using `{config.x}` instead of `${config.x}`, so the operator read the raw
+// placeholder text — e.g. "RSI({s.rsi_period ?? config.rsiPeriod}) Dip on ...".
+// (2) The LONG/SHORT branch keyed off `trigger && signal === 'SELL'`, so an
+// ARMED short hunt (regime DOWN, shorts on, no trigger yet) rendered as a long
+// dip setup: wrong direction, wrong trigger text and the wrong bracket.
+
+const inspectorFor = (
+  over: Partial<MarketSymbolData['signal']>,
+  cfg: BotConfig = baseConfig
+) =>
+  renderToStaticMarkup(
+    <SignalInspector symbolsData={[{ ...symbolData[0], signal: signal(over) }]} config={cfg} />
+  );
+
+// The literal-placeholder bug is generic: one missing `$` in any template
+// literal re-introduces it, so guard the whole render.
+const RAW_PLACEHOLDER = /\{(?:config|s)\./;
+
+const shortConfig: BotConfig = { ...baseConfig, allowShorts: true, market: 'futures' };
+
+test('signal inspector interpolates engine values instead of printing placeholders', () => {
+  const html = inspectorFor({});
+  assert.doesNotMatch(html, RAW_PLACEHOLDER);
+  assert.match(html, /RSI\(14\) Dip on 1h \(LONG\)/);
+  assert.match(html, /Close above EMA and EMA rising over 3d \(long regime\)/);
+  assert.match(html, /Trigger when RSI &lt; 40 and rising/);
+});
+
+test('an armed short hunt reads as SHORT, not as a long dip', () => {
+  const html = inspectorFor(
+    { regime: 'DOWN', trigger: false, signal: 'NEUTRAL', rsi: 61.4, rsi_prev: 58.2 },
+    shortConfig
+  );
+  assert.doesNotMatch(html, RAW_PLACEHOLDER);
+  assert.match(html, /RSI\(14\) Rip on 1h \(SHORT\)/);
+  assert.match(html, /Trigger when RSI &gt; 60 and falling/);
+  assert.match(html, /awaiting the rip/);
+  assert.match(html, /\+1\.20% SL/); // the mirrored bracket, not the long one
+  assert.doesNotMatch(html, /\(LONG\)/);
+});
+
+test('a fired short keeps the SHORT badge and the mirrored bracket', () => {
+  const html = inspectorFor(
+    { regime: 'DOWN', trigger: true, signal: 'SELL', rsi: 64.1, rsi_prev: 66.8 },
+    shortConfig
+  );
+  assert.match(html, /SHORT TRIGGER/);
+  assert.match(html, /\+1\.20% SL/);
+  assert.doesNotMatch(html, /\(LONG\)/);
+});
+
+test('a disarmed downtrend says the engine evaluated no entry at all', () => {
+  // baseConfig.allowShorts is false: decide() returns at the regime gate and rsi
+  // stays null, so the card must not claim a long dip is being watched.
+  const html = inspectorFor({ regime: 'DOWN', rsi: null, rsi_prev: null });
+  assert.doesNotMatch(html, RAW_PLACEHOLDER);
+  assert.match(html, /not evaluated \(no entry\)/);
+  assert.match(html, /long entries blocked/i);
+  assert.doesNotMatch(html, /\(LONG\)|\(SHORT\)/);
+});
+
+// ─── Per-symbol detail modal: same engine direction, mirrored bracket ────────
+//
+// The modal hard-coded the long bracket and a long-dip narrative, so opening a
+// symbol the engine was armed to SHORT showed a stop below entry and a TP above.
+
+const modalFor = (
+  over: Partial<MarketSymbolData['signal']>,
+  cfg: BotConfig = baseConfig
+) =>
+  renderToStaticMarkup(
+    <SymbolDetailModal
+      symbolData={{ ...symbolData[0], signal: signal(over) }}
+      config={cfg}
+      equity={100}
+      onClose={() => {}}
+    />
+  );
+
+test('per-symbol modal mirrors the bracket for an armed short regime', () => {
+  const html = modalFor(
+    { regime: 'DOWN', trigger: false, signal: 'NEUTRAL', rsi: 61.4, rsi_prev: 58.2 },
+    shortConfig
+  );
+  assert.match(html, /SHORT REGIME — WAITING FOR RIP/);
+  assert.match(html, /2\. RSI Rip &amp; Turn/);
+  assert.match(html, /&gt; 60 = rip/);
+  assert.match(html, /Fixed % Bracket &amp; Sizing \(SHORT mirror\)/);
+  assert.match(html, /Stop \+1\.20% \(above\)/);
+  assert.match(html, /Take Profit -3\.00% \(below\)/);
+  // The levels themselves must mirror, not just the labels: entry 3.21.
+  assert.match(html, /3\.248520/); // stop ABOVE entry (3.21 * 1.012)
+  assert.match(html, /3\.113700/); // take-profit BELOW entry (3.21 * 0.97)
+  assert.doesNotMatch(html, /Stop -1\.20%/);
+  assert.doesNotMatch(html, /REGIME UP/);
+});
+
+test('per-symbol modal keeps the long bracket when no short is armed', () => {
+  const html = modalFor({});
+  assert.match(html, /REGIME UP — WAITING FOR DIP/);
+  assert.match(html, /2\. RSI Dip &amp; Turn/);
+  assert.match(html, /&lt; 40 = dip/);
+  assert.match(html, /Stop -1\.20%/);
+  assert.match(html, /Take Profit \+3\.00%/);
+  assert.match(html, /3\.171480/); // stop BELOW entry (3.21 * 0.988)
+  assert.match(html, /3\.306300/); // take-profit ABOVE entry (3.21 * 1.03)
+  assert.doesNotMatch(html, /SHORT mirror/);
+});
+
+test('per-symbol modal says a disarmed downtrend evaluates no entry', () => {
+  const html = modalFor({ regime: 'DOWN', rsi: null, rsi_prev: null });
+  assert.match(html, /REGIME DOWN — NO ENTRY/);
+  assert.match(html, /Not evaluated/);
+  assert.doesNotMatch(html, /SHORT mirror/);
+});
+
+test("per-symbol modal labels the venue from the engine's MARKET", () => {
+  assert.match(modalFor({}), /Binance Spot Market/);
+  assert.match(modalFor({}, shortConfig), /Binance USDⓈ-M Futures/);
 });

@@ -251,6 +251,10 @@ if config["STRATEGY_MODE"] != "rsi_dip":
     raise ValueError("STRATEGY_MODE must be 'rsi_dip' (the only supported strategy).")
 ```
 
+The strategy is **direction-symmetric**: by default it takes the proven **long** RSI-dip only; with
+`ALLOW_SHORTS=true` on futures it also takes the mirrored **short** — same gate, same RSI read,
+reflected bracket ([§4.3](#43-short-side-mirror-armed-on-futures)).
+
 ### 4.1 Regime gate (daily, completed candles only)
 
 Bullish regime requires the daily close **above** a rising EMA:
@@ -258,7 +262,9 @@ Bullish regime requires the daily close **above** a rising EMA:
 - `REGIME_EMA=50` — close > EMA50 *and* the EMA slope over `REGIME_SLOPE_DAYS=3` is positive.
 - Completed candles only, so the gate cannot repaint intraday.
 
-Never buys a downtrend: a flat or falling regime blocks entries entirely.
+Never buys a downtrend: a flat or falling regime blocks **long** entries entirely — and, with
+`ALLOW_SHORTS` armed, a genuinely falling regime instead arms the mirrored short
+([§4.3](#43-short-side-mirror-armed-on-futures)).
 
 ### 4.2 Entry trigger (RSI dip)
 
@@ -269,11 +275,37 @@ Never buys a downtrend: a flat or falling regime blocks entries entirely.
 - Optional gates exist and are **off** in the proven preset (`ENTRY_MAX_EXT_ATR`,
   `ENTRY_VOL_MULT`, `ENTRY_REQUIRE_RSI_RISE2`).
 
-### 4.3 Exits
+### 4.3 Short-side mirror (armed on futures)
+
+The engine is **not** long-only. `ALLOW_SHORTS=true` arms the mirror image of the same strategy, so
+the regime gate, the RSI read and the bracket all invert together:
+
+- **Regime (inverted).** A short regime is the daily close **below** a **falling** EMA
+  (`REGIME_EMA=50`) — the exact mirror of §4.1. A flat or *rising* tape produces no short.
+- **Trigger (inverted).** RSI on the same `RSI_TIMEFRAME=1h` bucket must rise **above**
+  `SHORT_RSI_OVERBOUGHT` (60) and turn **down** — an overbought rip, not a dip.
+- **Bracket (mirrored).** Stop **above** entry (`SHORT_SL_PERCENT`, 1.2%), take-profit **below**
+  entry (`SHORT_TP_PERCENT`, 3.0%), sharing the long side's `MIN_TP_PERCENT` floor and
+  `MIN_RISK_REWARD` widening.
+- **Futures only.** `config.py` refuses `ALLOW_SHORTS` when `MARKET=spot`. Venue aside everything
+  else is shared: fixed-fractional sizing, the daily breaker, streak cooldowns and the R/R gate.
+  The optional entry-quality gates in §4.2 are **long-shaped** and do not run on the short path.
+
+The `SHORT_*` levels are separate tunables, so shorting can be tuned without touching the proven
+long config, and they are validated at boot **even while `ALLOW_SHORTS` is off** — a later opt-in can
+never be blocked by a bad value that sat unchecked.
+
+> ⚠️ **This repo's deployed `.env` has `ALLOW_SHORTS=true`** (with `MARKET=futures`). That arm rests
+> on a **2026-09-30 futures replay**, not the 2026-09-14 battery the long side was proven on — no
+> version of the §4.6 provenance battery covers the short side. See
+> [§15](#15-repository-audit--current-findings) item 1.
+
+### 4.4 Exits
 
 | Mechanism | Setting | Proven value |
 |---|---|---|
 | Fixed % bracket | `SL_PERCENT` / `TP_PERCENT` | −1.2% / +3.0% (both MARKET orders) |
+| Short bracket (mirrored) | `SHORT_SL_PERCENT` / `SHORT_TP_PERCENT` | +1.2% / −3.0% — only while `ALLOW_SHORTS=true` ([§4.3](#43-short-side-mirror-armed-on-futures)) |
 | Minimum reward | `MIN_RISK_REWARD` / `MIN_TP_PERCENT` | 1.5 R / 3% floor |
 | Time stop | `MAX_HOLD_TIME` | 84 600 s (~1 day) |
 | Trailing | `TRAILING_ATR_MULTIPLIER` | 2.0 × ATR (ATR-trail mode, activate at +1%) |
@@ -284,7 +316,7 @@ Never buys a downtrend: a flat or falling regime blocks entries entirely.
 Exit policy lives in **`src/strategies/trade_policy.py`** and is imported by *both* the live
 path (`trade_logic.py`) and the backtest — so a backtest cannot disagree with live behaviour.
 
-### 4.4 Sizing & frequency
+### 4.5 Sizing & frequency
 
 - **Fixed-fractional:** risk `RISK_PER_TRADE` (1%) of equity between entry and stop, so the
   *stop distance* sets the position size — not the balance.
@@ -293,7 +325,7 @@ path (`trade_logic.py`) and the backtest — so a backtest cannot disagree with 
 - Proven frequency: **2 entries per UTC day** (`MAX_TRADES_PER_DAY=2` in the preset;
   `0` = unlimited).
 
-### 4.5 Preset provenance
+### 4.6 Preset provenance
 
 ```
 intraday_rsi — 2026-09-14 battery, NEARUSDT, 30 pages ≈ 104 days, $22 equity,
@@ -308,12 +340,14 @@ change (see [§11](#11-verification--test-matrix)). Since 2026-09-22 it also res
 way the engine does (`.env` overrides the preset), so a bare run measures the config that is actually
 trading rather than the preset.
 
-> ⚠️ **The deployed `.env` overrides 8 of these preset keys** — `RSI_TIMEFRAME`, `RSI_PERIOD`,
-> `REGIME_EMA`, `REGIME_SLOPE_DAYS`, `MTF_TIMEFRAME`, `MAX_TRADES_PER_DAY`,
-> `BREAKEVEN_ENABLED` and `CLOSE_AT_UTC_DAY_END` — so the *running* strategy is not
-> byte-for-byte the validated preset. Now that the backtest resolves config the same way, the two can
-> be compared on one window: the preset returns **+0.41% / PF 1.02**, the deployed config
-> **−7.80% / PF 0.73**. See [§15](#15-repository-audit--current-findings) item 1.
+> ⚠️ **Two deviations from the validated preset remain, one of them inert.** `RSI_PERIOD` is `14`
+> against the preset's `7`, and the `.env` arms the `ALLOW_SHORTS` short mirror (a feature the preset
+> does not define). `TRAILING_STOP_CALLBACK` is `0.005` vs the preset's `0.01` but is unused while
+> `TRAILING_ATR_MULTIPLIER=2` (ATR-trail mode). Everything else — the exit bracket, the 2/day
+> frequency, `MIN_TP_PERCENT`, the fixed-% stop and the EOD close — was reconciled back to the
+> preset on **2026-10-01**; the eight strategy-key overrides that used to wrong-win are gone. The
+> retained `RSI_PERIOD=14` + shorts combination rests on a separate 2026-09-30 futures replay, not
+> the 2026-09-14 battery. See [§15](#15-repository-audit--current-findings) item 1.
 
 ---
 
@@ -567,13 +601,13 @@ not tighter than its activation (callback mode), `RISK_PER_TRADE > 0.1`, allocat
 **No inline comments on value lines.** This dotenv build passes trailing `# …` straight into
 the value; comment on the line above.
 
-**`.env.example` mirrors the live deployment, not a safe sandbox** — reconciled 2026-09-22 so
-the template and `.env` share all **90 keys with zero drift** (only the three credential keys
+**`.env.example` mirrors the live deployment, not a safe sandbox** — last reconciled 2026-10-01 so
+the template and `.env` share all **94 keys with zero drift** (only the three credential keys
 keep placeholders). This matters beyond documentation: `status.py` falls back to the template
 as its config source when `.env` is missing, and seeds a new `.env` from it. The template
 therefore opens in the production posture (`PAPER_TRADE=false`, `FUTURES_MARGIN_TYPE=CROSSED`,
-`MAX_TRADES_PER_DAY=0`), and its header block lists exactly which keys to change back for a
-fresh deployment.
+`FUTURES_LEVERAGE=5`, `MAX_TRADES_PER_DAY=2`), and its header block lists exactly which keys to
+change back for a fresh deployment.
 
 **Keep the two files in sync — automatically.** `npm run check:env` fails when they diverge,
 so a tuner push (which writes `.env` only) can never leave the template quietly lying about
@@ -777,7 +811,8 @@ Full version with verification commands: **[GO_LIVE.md](./GO_LIVE.md)**.
 
 ## 15. Repository audit — current findings
 
-Re-audited on 2026-09-22 (every tracked file, every function, both languages).
+Re-audited on 2026-09-22; the current-state figures in this section were refreshed **2026-10-01**
+(audit covers every tracked file, every function, both languages).
 
 **Clean**
 
@@ -884,9 +919,11 @@ Re-audited on 2026-09-22 (every tracked file, every function, both languages).
   engine would boot-fail on its next restart; the check now runs before the write. Guarded by
   `test_scenarios.py` **S19**, every check mutation-verified. See the changelog entry for
   2026-09-26 (15).
-- **No config drift:** `.env` and `.env.example` share all **90 keys with zero drift** (the
-  only differences are the three credential keys, which keep placeholders). Nine keys
-disagreed before the 2026-09-22 reconciliation recorded in the changelog.
+- **No config drift:** `.env` and `.env.example` share all **94 keys with zero drift** (the
+  only differences are the three credential keys, which keep placeholders); re-verified
+  **2026-10-01** after the strategy reconciliation. Nine keys disagreed before the 2026-09-22
+  reconciliation recorded in the changelog, and the count drifted from 90 to 94 in 2026-09-30 when
+  the four `ALLOW_SHORTS`/`SHORT_*` keys were added without updating it.
 - **Drift is now guarded, not just documented:** `ultimate-bot/check_env_drift.py`
   (`npm run check:env`) fails on lost/added keys, duplicate keys, value drift, inline comments
   and any real credential reaching the template. It was verified against ten scenarios,
@@ -902,15 +939,21 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 **Watch these**
 
-1. **The deployed config used to override the `intraday_rsi` preset on 8 strategy keys — RESOLVED
-   2026-09-26 (16).** The live `.env` wrong-won wherever it set a key; those eight keys
-   (`RSI_TIMEFRAME` `30m`, `RSI_PERIOD` `14`, `REGIME_SLOPE_DAYS` `2`, `MTF_TIMEFRAME` `4h`,
-   `MAX_TRADES_PER_DAY` `0`, `BREAKEVEN_ENABLED` `true`, `CLOSE_AT_UTC_DAY_END` `false`,
-   `RSI_TIMEFRAME_MS` `1800000`) were reverted to the validated preset values after a futures
-   backtest sweep showed them strictly harmful. See the changelog entry for 2026-09-26 (16) for the
-   evidence (preset-aligned beat deployed in **6/6** symbol×window comparisons; futures expectancy
-   flipped from negative to roughly break-even-to-positive). The preset is what §4 documents and what
-   the provenance battery validated, and it is again what trades.
+1. **The deployed config's preset overrides — RESOLVED 2026-09-26 (16), re-checked and re-reconciled
+   2026-10-01 (17).** The 2026-09-26 sweep reverted eight strategy keys (`RSI_TIMEFRAME` `30m`,
+   `RSI_PERIOD` `14`, `REGIME_SLOPE_DAYS` `2`, `MTF_TIMEFRAME` `4h`, `MAX_TRADES_PER_DAY` `0`,
+   `BREAKEVEN_ENABLED` `true`, `CLOSE_AT_UTC_DAY_END` `false`, `RSI_TIMEFRAME_MS` `1800000`) to the
+   validated preset values, after a futures backtest sweep showed them strictly harmful
+   (preset-aligned beat deployed in **6/6** symbol×window comparisons). A later deployment then
+   re-drifted on four of them **without updating this section**: `MAX_TRADES_PER_DAY` `10` (4× the
+   validated 2/day), `BREAKEVEN_ENABLED` `true`, `SL_ATR_MULTIPLIER` `1`, and `MIN_TP_PERCENT`
+   `0.04` — which sat *above* `TP_PERCENT` and, because `trade_policy.effective_bracket` treats it
+   as a **floor**, silently widened every take-profit from +3% to **+4%** on both legs. All four
+   were re-reconciled to the preset on 2026-10-01. **Two deviations are deliberately retained** —
+   `RSI_PERIOD=14` and the armed `ALLOW_SHORTS` mirror — on the strength of a 2026-09-30 futures
+   replay rather than the 2026-09-14 battery; the retained `TRAILING_STOP_CALLBACK=0.005` is inert
+   while `TRAILING_ATR_MULTIPLIER=2`. The preset is what §4 documents and what the provenance
+   battery validated.
 2. **Backtest↔live parity: the exit decision is now literally shared.** Fixed 2026-09-22/23 — the
    backtest resolves config **env-first** exactly like `config.load_config()` (verified at zero
    differences across every non-credential key), it applies the `FUNDING_RATE_MAX` **entry gate** so a
@@ -935,6 +978,26 @@ disagreed before the 2026-09-22 reconciliation recorded in the changelog.
 
 Newest first. Entries marked **⚙️ engine** carry deeper detail in
 [ultimate-bot/README.md](./ultimate-bot/README.md).
+
+### 2026-10-01 (17) — Strategy reconciliation: four preset overrides reverted 📋
+
+**A re-check of §15 found the deployed `.env` had re-drifted from the validated `intraday_rsi`
+preset after the 2026-09-26 sweep. The drifting keys carried explanatory comments in `.env` but no
+backtest evidence against the preset.**
+
+- **`MIN_TP_PERCENT=0.04` sat above `TP_PERCENT=0.03`.** Because `trade_policy.effective_bracket`
+  treats `MIN_TP_PERCENT` as a **floor**, it silently widened every take-profit from the documented
+  +3.0% to **+4.0%**, on both the long and short legs. Reverted to `0.03` (brackets now verified at
+  ±1.2% / ±3.0% on both sides).
+- `MAX_TRADES_PER_DAY` `10` → **`2`** (4× the validated frequency), `BREAKEVEN_ENABLED`
+  `true` → **`false`** (the edge was proven without it), and `SL_ATR_MULTIPLIER` `1` → **`0`**
+  (restores the preset's fixed-% stop).
+- **Deliberately retained:** `RSI_PERIOD=14` and `ALLOW_SHORTS=true` (2026-09-30 futures replay, not
+  the 2026-09-14 battery); `FUTURES_LEVERAGE=5` and `FUTURES_MARGIN_TYPE=CROSSED` unchanged.
+- Applied to `.env` and mirrored into `.env.example`; verified `check:env` **IN SYNC (94 keys)**,
+  `load_config()` clean, the live engine reloaded (`LIVE EXECUTION`, no `CONFIG WARNING`), the served
+  `/api/status` confirming the new values, and `smoke` **13/13**. This also refreshed the stale
+  **90-key** figure in §8/§15 (it became 94 when the four short keys were added).
 
 ### 2026-09-26 (16) — Futures profitability: the deployed strategy overrides were losing money 💹
 

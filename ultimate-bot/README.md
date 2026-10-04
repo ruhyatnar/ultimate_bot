@@ -1862,9 +1862,10 @@ any backtest figure as a forecast.
 
 `backtest.py` looked like it reproduced the deployment because its CLI defaults come from `BACKTEST_*`,
 but its *strategy* config applied the preset on top of `load_config()`, so on this repo's `.env` the two
-configurations disagreed on **eight strategy keys**:
+configurations disagreed on **eight strategy keys** (the values below are the `.env` as it stood on
+**2026-09-22**, when the defect was found):
 
-| Key | Live engine (`.env`-led) | Backtest (preset-led) |
+| Key | Live engine, then (`.env`-led) | Backtest, then (preset-led) |
 |---|---|---|
 | `MTF_TIMEFRAME` | `4h` | `1d` |
 | `RSI_TIMEFRAME` | `30m` | `1h` |
@@ -1898,6 +1899,20 @@ reads every one of them with `os.getenv(...)` ahead of the preset.
 is the *default layer* and `.env` wins — exactly the engine's order — while `overrides` still apply last
 so sweeps can vary preset-pinned keys. Verified: **zero non-credential key differences** against the
 engine's own `load_config()`.
+
+**Current state (2026-10-01).** The `.env` was subsequently reconciled back to the preset (see the
+repository README §15 item 1), so the eight-key gap above is historical. Two preset keys still
+differ, plus one non-preset addition:
+
+| Key | Live `.env` | Preset | Note |
+|---|---|---|---|
+| `RSI_PERIOD` | `14` | `7` | retained on a 2026-09-30 futures replay, not the 2026-09-14 battery |
+| `TRAILING_STOP_CALLBACK` | `0.005` | `0.01` | inert while `TRAILING_ATR_MULTIPLIER=2` (ATR-trail mode) |
+| `ALLOW_SHORTS` | `true` | *(not in the preset)* | arms the futures-only short mirror |
+
+Everything else — `MTF_TIMEFRAME`, `RSI_TIMEFRAME`, `REGIME_EMA`, `REGIME_SLOPE_DAYS`,
+`MAX_TRADES_PER_DAY`, `BREAKEVEN_ENABLED`, `MIN_TP_PERCENT`, `SL_ATR_MULTIPLIER` and
+`CLOSE_AT_UTC_DAY_END` included — now matches the preset.
 
 **Why it mattered.** With the old order the documented test-matrix command measured the preset, not the
 deployment. Run on one identical window (NEARUSDT, 30 pages ≈ 104 days, $22 equity, 2026-09-22):
@@ -2119,6 +2134,28 @@ MAX_SLIPPAGE_PERCENT=0.5   # skip entry if price moved more than this
 The engine applies two guards on top of the raw trigger:
 - **Daily regime alignment** — a BUY is blocked unless the completed daily close is above its EMA and the EMA is rising, so the engine never buys into a downtrend just because RSI dipped.
 - **R:R gate (`MIN_RISK_REWARD`, default 1.5)** — a TP closer than the configured multiple of the SL distance is widened before the order is placed.
+
+### Short-side mirror (futures only)
+```ini
+ALLOW_SHORTS=false          # arms the symmetric SELL signal; requires MARKET=futures
+SHORT_RSI_OVERBOUGHT=60     # rip level (RSI > this and turning down)
+SHORT_SL_PERCENT=0.012      # +1.2% stop above entry (mirrored long stop)
+SHORT_TP_PERCENT=0.03       # -3.0% take profit below entry
+```
+
+When `ALLOW_SHORTS=true` (and `MARKET=futures` — `config.py` refuses the combination on spot), the
+signal mirrors: a **SELL** fires in a confirmed daily downtrend (close below a **falling** EMA, the
+same gate inverted) when RSI rises **above** `SHORT_RSI_OVERBOUGHT` and turns down. The bracket is
+mirrored too — stop above entry, take-profit below — and shares the same `MIN_TP_PERCENT` floor and
+`MIN_RISK_REWARD` widening as the long side, so a mirrored bracket can never be fee-negative either.
+`ALLOW_SHORTS` is **off by default** so the proven long baseline is byte-for-byte unchanged, and the
+`SHORT_*` levels are validated at boot even while it is off, so a later opt-in cannot be blocked by a
+bad value that sat unchecked. Sizing, risk and the R:R gate are identical to the long side; the
+optional entry-quality gates (`ENTRY_MAX_EXT_ATR`, `ENTRY_VOL_MULT`, `ENTRY_RSI_MIN`,
+`ENTRY_REQUIRE_RSI_RISE2`) are long-shaped and are **not** applied to the short path.
+
+> **This repo's deployed `.env` has `ALLOW_SHORTS=true`** (with `MARKET=futures`) on the strength of a
+> 2026-09-30 futures replay — see the repository README §15 item 1.
 
 ### Risk model & trade management
 ```ini
